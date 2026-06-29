@@ -220,15 +220,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
 
                 if use_weight_map and weight_map is not None and weight_densify_thr > 0:
                     H, W = image.shape[1], image.shape[2]
-                    pts2d = viewspace_point_tensor[visibility_filter]
-                    px = ((pts2d[:, 0] + 1.0) * 0.5 * W).long().clamp(0, W - 1)
-                    py = ((pts2d[:, 1] + 1.0) * 0.5 * H).long().clamp(0, H - 1)
+                    # visibility_filter 是 (M,1) 的 indices，展平为 1D
+                    vis_idx = visibility_filter.squeeze(-1)
+                    # 用相机投影矩阵将 3D 高斯中心投影到 2D 像素坐标
+                    xyz = gaussians.get_xyz[vis_idx]  # (M, 3)
+                    ones = torch.ones(xyz.shape[0], 1, device="cuda")
+                    xyz_h = torch.cat([xyz, ones], dim=1)  # (M, 4)
+                    # full_proj_transform: world -> clip space (4x4)
+                    proj = xyz_h @ viewpoint_cam.full_proj_transform  # (M, 4)
+                    ndc = proj[:, :2] / (proj[:, 3:4] + 1e-8)  # (M, 2) NDC [-1, 1]
+                    px = ((ndc[:, 0] + 1.0) * 0.5 * W).long().clamp(0, W - 1)
+                    py = ((ndc[:, 1] + 1.0) * 0.5 * H).long().clamp(0, H - 1)
                     vis_weights = weight_map[0, py, px]
                     high_conf_mask = vis_weights > weight_densify_thr
                     high_conf_full = torch.zeros(
                         viewspace_point_tensor.shape[0], dtype=torch.bool, device="cuda"
                     )
-                    vis_idx = visibility_filter.nonzero(as_tuple=True)[0]
                     if high_conf_mask.any():
                         high_conf_full[vis_idx[high_conf_mask]] = True
                     gaussians.add_densification_stats(viewspace_point_tensor, high_conf_full)
@@ -240,7 +247,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                     gaussians.densify_and_prune(
                         opt.densify_grad_threshold, 0.005,
                         scene.cameras_extent, size_threshold,
-                        radii if use_sparse_adam else None,
+                        radii,
                     )
 
                 if iteration % opt.opacity_reset_interval == 0 or (
