@@ -449,7 +449,9 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii,
+                          weight_scores=None, weight_prune_thr=0.0):
+        n_old = self.get_xyz.shape[0]
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -462,6 +464,13 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+
+        if weight_scores is not None and weight_prune_thr > 0:
+            n_current = self.get_xyz.shape[0]
+            low_weight_mask = torch.zeros(n_current, dtype=torch.bool, device="cuda")
+            low_weight_mask[:n_old] = weight_scores[:n_old] < weight_prune_thr
+            prune_mask = torch.logical_or(prune_mask, low_weight_mask)
+
         self.prune_points(prune_mask)
         tmp_radii = self.tmp_radii
         self.tmp_radii = None

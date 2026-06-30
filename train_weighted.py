@@ -43,6 +43,7 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 from utils.weight_map_utils import WeightMapLoader
+from utils.surface_utils import compute_normal_consistency_loss
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations,
@@ -92,6 +93,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
     else:
         print("[WeightMap] Disabled: running as vanilla 3DGS")
     # ──────────────────────────────────────────────────────────────────
+
+    gaussian_weight_accum = None
+    gaussian_weight_count = None
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -185,6 +189,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         else:
             Ll1depth = 0
 
+        # ── 权重积累：每帧将可见Gaussian的权重分数累加 ─────────────────
+        if use_weight_map and weight_map is not None:
+            n_gaussians = gaussians.get_xyz.shape[0]
+            if gaussian_weight_accum is None or gaussian_weight_accum.shape[0] != n_gaussians:
+                gaussian_weight_accum = torch.zeros(n_gaussians, device="cuda")
+                gaussian_weight_count = torch.zeros(n_gaussians, device="cuda")
+
+            vis_idx = visibility_filter.squeeze(-1)
+            xyz = gaussians.get_xyz[vis_idx]
+            ones = torch.ones(xyz.shape[0], 1, device="cuda")
+            xyz_h = torch.cat([xyz, ones], dim=1)
+            proj = xyz_h @ viewpoint_cam.full_proj_transform
+            ndc = proj[:, :2] / (proj[:, 3:4] + 1e-8)
+            H, W = image.shape[1], image.shape[2]
+            px = ((ndc[:, 0] + 1.0) * 0.5 * W).long().clamp(0, W - 1)
+            py = ((ndc[:, 1] + 1.0) * 0.5 * H).long().clamp(0, H - 1)
+            vis_weights = weight_map[0, py, px]
+            gaussian_weight_accum[vis_idx] += vis_weights
+            gaussian_weight_count[vis_idx] += 1
+        # ──────────────────────────────────────────────────────────────
+
+        # ── 法向一致性约束（模块3）────────────────────────────────────
+        if use_weight_map and getattr(opt, "use_normal_loss", False):
+            normal_loss = compute_normal_consistency_loss(
+                gaussians,
+                weight_scores=None,
+                k_neighbors=10,
+                lambda_normal=getattr(opt, "lambda_normal", 0.01),
+                sample_size=2000,
+            )
+            loss = loss + normal_loss
+        # ──────────────────────────────────────────────────────────────
+
         loss.backward()
         iter_end.record()
 
@@ -244,10 +281,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+
+                    weight_scores = None
+                    if gaussian_weight_accum is not None and gaussian_weight_accum.shape[0] == gaussians.get_xyz.shape[0]:
+                        valid = gaussian_weight_count > 0
+                        avg_scores = torch.ones(gaussian_weight_accum.shape[0], device="cuda")
+                        avg_scores[valid] = gaussian_weight_accum[valid] / gaussian_weight_count[valid]
+                        weight_scores = avg_scores
+                        gaussian_weight_accum = None
+                        gaussian_weight_count = None
+
                     gaussians.densify_and_prune(
                         opt.densify_grad_threshold, 0.005,
                         scene.cameras_extent, size_threshold,
                         radii,
+                        weight_scores=weight_scores,
+                        weight_prune_thr=getattr(opt, "weight_prune_thr", 0.2),
                     )
 
                 if iteration % opt.opacity_reset_interval == 0 or (
