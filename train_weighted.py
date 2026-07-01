@@ -282,11 +282,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
 
-                    # 【修复】权重剪枝：在 densify 前计算权重分数，传给 densify_and_prune
-                    # 注意：weight_scores 必须在 densify_and_clone/split 前计算，因为它们会增加点数
+                    # 权重剪枝：在 densify 前计算权重分数（旧点在前 n_old）,
+                    # weight_prune_thr 表示剪枝比例(百分位), 实际阈值在 densify_and_prune 内用分位数确定。
                     weight_scores = None
                     weight_prune_thr = getattr(opt, "weight_prune_thr", 0.2)
-                    
+
                     if gaussian_weight_accum is not None and gaussian_weight_accum.shape[0] == gaussians.get_xyz.shape[0]:
                         valid = gaussian_weight_count > 0
                         avg_scores = torch.ones(gaussian_weight_accum.shape[0], device="cuda")
@@ -294,18 +294,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                         weight_scores = avg_scores
                         gaussian_weight_accum = None
                         gaussian_weight_count = None
-                        
-                        # 【修复】防止权重剪枝过度：如果剪枝比例过高，降低阈值或跳过权重剪枝
-                        if weight_scores is not None and weight_prune_thr > 0:
-                            n_points = gaussians.get_xyz.shape[0]
-                            n_to_prune = (weight_scores < weight_prune_thr).sum().item()
-                            prune_ratio = n_to_prune / max(n_points, 1)
-                            
-                            # 如果剪枝比例超过 80%，降低阈值以保留更多点
-                            if prune_ratio > 0.8:
-                                weight_prune_thr = weight_scores.quantile(0.8).item()
-                                print(f"[ITER {iteration}] Weight prune ratio too high ({prune_ratio:.1%}), "
-                                      f"lowering threshold from {getattr(opt, 'weight_prune_thr', 0.2):.3f} to {weight_prune_thr:.3f}")
 
                     gaussians.densify_and_prune(
                         opt.densify_grad_threshold, 0.005,

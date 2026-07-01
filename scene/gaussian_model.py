@@ -465,31 +465,30 @@ class GaussianModel:
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
 
-        # 【修复】权重剪枝：加入健壮性检查
+        # 权重剪枝：百分位数自适应阈值
+        # weight_prune_thr 的语义 = 剪枝比例（例如 0.2 = 剪掉权重分数最低的 20% 高斯点）,
+        # 而非固定的绝对阈值。这样剪枝比例恒定可控, 不受权重图数值分布右偏的影响。
         if weight_scores is not None and weight_prune_thr > 0:
             n_current = self.get_xyz.shape[0]
-            
-            # 【修复】验证 weight_scores 长度是否与旧点数匹配
+
+            # 验证 weight_scores 长度是否与旧点数匹配（densify 只新增点, 旧点在前 n_old）
             if weight_scores.shape[0] != n_old:
                 print(f"[WARNING] weight_scores shape mismatch: {weight_scores.shape[0]} vs n_old={n_old}, "
                       f"skipping weight-based pruning")
             else:
+                # 用分位数把 weight_prune_thr 当作"剪枝比例"转成实际阈值
+                ratio = min(max(float(weight_prune_thr), 0.0), 0.9)  # 限制最多剪 90%
+                old_scores = weight_scores[:n_old]
+                percentile_thr = torch.quantile(old_scores, ratio).item()
+
                 low_weight_mask = torch.zeros(n_current, dtype=torch.bool, device="cuda")
-                low_weight_mask[:n_old] = weight_scores[:n_old] < weight_prune_thr
-                
-                # 【修复】防止权重剪枝把所有点都剪掉
-                n_to_prune = low_weight_mask.sum().item()
+                low_weight_mask[:n_old] = old_scores < percentile_thr
+
                 n_to_keep = (~low_weight_mask).sum().item()
-                
-                # 如果权重剪枝会导致所有点都被剪掉，跳过权重剪枝
-                if n_to_keep == 0:
-                    print(f"[WARNING] Weight pruning would remove all {n_current} points, skipping weight-based pruning")
+                if n_to_keep < 10:
+                    print(f"[WARNING] Percentile pruning would keep only {n_to_keep} points, skipping")
                 else:
-                    # 如果权重剪枝会导致保留点数过少（<10），也跳过
-                    if n_to_keep < 10:
-                        print(f"[WARNING] Weight pruning would keep only {n_to_keep} points, skipping weight-based pruning")
-                    else:
-                        prune_mask = torch.logical_or(prune_mask, low_weight_mask)
+                    prune_mask = torch.logical_or(prune_mask, low_weight_mask)
 
         self.prune_points(prune_mask)
         tmp_radii = self.tmp_radii
