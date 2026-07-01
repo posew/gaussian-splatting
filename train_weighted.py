@@ -402,13 +402,8 @@ if __name__ == "__main__":
                         help="预计算权重图目录名（位于 source_path 下）")
     parser.add_argument("--weight_densify_thr", type=float, default=0.3,
                         help="低于此权重的区域抑制 densification（0=不抑制）")
-    # ── 新剪枝参数 ──
-    parser.add_argument("--aniso_thr", type=float, default=8.0,
-                        help="各向异性比阈值(max/min scale), 超过则剪枝狭长 floater(0=关闭)")
-    parser.add_argument("--aniso_min_scale_ratio", type=float, default=0.001,
-                        help="各向异性剪枝的最小尺度保护(相对 scene_extent), 避免误伤细节点")
-    parser.add_argument("--contrib_prune_thr", type=float, default=0.1,
-                        help="贡献度剪枝比例(百分位), 剪掉可见频次×不透明度最低的比例(0=关闭)")
+    # 注：--aniso_thr / --aniso_min_scale_ratio / --contrib_prune_thr
+    # 已通过 OptimizationParams(ParamGroup) 自动注册, 无需再手动 add_argument.
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -423,9 +418,7 @@ if __name__ == "__main__":
     op_args.weight_map_beta = args.weight_map_beta
     op_args.weight_map_dir = args.weight_map_dir
     op_args.weight_densify_thr = args.weight_densify_thr
-    op_args.aniso_thr = args.aniso_thr
-    op_args.aniso_min_scale_ratio = args.aniso_min_scale_ratio
-    op_args.contrib_prune_thr = args.contrib_prune_thr
+    # aniso_thr/aniso_min_scale_ratio/contrib_prune_thr 由 op.extract 自动带出
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(
