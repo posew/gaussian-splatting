@@ -282,7 +282,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                         radii,
                         aniso_thr=getattr(opt, "aniso_thr", 8.0),
                         aniso_min_scale_ratio=getattr(opt, "aniso_min_scale_ratio", 0.001),
-                        contrib_prune_thr=getattr(opt, "contrib_prune_thr", 0.1),
+                        contrib_prune_thr=getattr(opt, "contrib_prune_thr", 0.0),
                         visibility_count=visibility_count,
                     )
                     # 剪枝后可见频次计数失效（点集变了），重置

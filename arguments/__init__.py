@@ -103,7 +103,7 @@ class OptimizationParams(ParamGroup):
         # ── 新剪枝参数：几何异常 + 贡献度近似 ──
         self.aniso_thr = 8.0               # 各向异性比阈值, max/min scale 超过则视为狭长 floater
         self.aniso_min_scale_ratio = 0.001 # 各向异性剪枝的最小尺度保护(相对 scene_extent)
-        self.contrib_prune_thr = 0.1       # 贡献度剪枝比例(百分位), 剪掉贡献最低的 10%
+        self.contrib_prune_thr = 0.0  # v3: 关闭贡献度剪枝, 只保留各向异性剪枝       # 贡献度剪枝比例(百分位), 剪掉贡献最低的 10%
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
