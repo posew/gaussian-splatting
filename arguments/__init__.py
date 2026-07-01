@@ -97,9 +97,13 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
-        self.weight_prune_thr = 0.2
+        self.weight_prune_thr = 0.2  # (deprecated) 旧权重图剪枝比例, 已弃用
         self.use_normal_loss = False
         self.lambda_normal = 0.01
+        # ── 新剪枝参数：几何异常 + 贡献度近似 ──
+        self.aniso_thr = 8.0               # 各向异性比阈值, max/min scale 超过则视为狭长 floater
+        self.aniso_min_scale_ratio = 0.001 # 各向异性剪枝的最小尺度保护(相对 scene_extent)
+        self.contrib_prune_thr = 0.1       # 贡献度剪枝比例(百分位), 剪掉贡献最低的 10%
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

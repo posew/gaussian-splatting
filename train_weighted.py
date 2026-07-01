@@ -94,8 +94,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         print("[WeightMap] Disabled: running as vanilla 3DGS")
     # ──────────────────────────────────────────────────────────────────
 
-    gaussian_weight_accum = None
-    gaussian_weight_count = None
+    # 贡献度近似：累计每个高斯自上次剪枝以来被观测到（可见）的帧数
+    gaussian_visibility_count = None
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -189,25 +189,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
         else:
             Ll1depth = 0
 
-        # ── 权重积累：每帧将可见Gaussian的权重分数累加 ─────────────────
-        if use_weight_map and weight_map is not None:
+        # ── 可见频次积累：贡献度近似（每帧对可见的高斯计数 +1）─────────────
+        if iteration < opt.densify_until_iter:
             n_gaussians = gaussians.get_xyz.shape[0]
-            if gaussian_weight_accum is None or gaussian_weight_accum.shape[0] != n_gaussians:
-                gaussian_weight_accum = torch.zeros(n_gaussians, device="cuda")
-                gaussian_weight_count = torch.zeros(n_gaussians, device="cuda")
-
-            vis_idx = visibility_filter.squeeze(-1)
-            xyz = gaussians.get_xyz[vis_idx]
-            ones = torch.ones(xyz.shape[0], 1, device="cuda")
-            xyz_h = torch.cat([xyz, ones], dim=1)
-            proj = xyz_h @ viewpoint_cam.full_proj_transform
-            ndc = proj[:, :2] / (proj[:, 3:4] + 1e-8)
-            H, W = image.shape[1], image.shape[2]
-            px = ((ndc[:, 0] + 1.0) * 0.5 * W).long().clamp(0, W - 1)
-            py = ((ndc[:, 1] + 1.0) * 0.5 * H).long().clamp(0, H - 1)
-            vis_weights = weight_map[0, py, px]
-            gaussian_weight_accum[vis_idx] += vis_weights
-            gaussian_weight_count[vis_idx] += 1
+            if gaussian_visibility_count is None or gaussian_visibility_count.shape[0] != n_gaussians:
+                gaussian_visibility_count = torch.zeros(n_gaussians, device="cuda")
+            gaussian_visibility_count[visibility_filter] += 1
         # ──────────────────────────────────────────────────────────────
 
         # ── 法向一致性约束（模块3）────────────────────────────────────
@@ -282,26 +269,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
 
-                    # 权重剪枝：在 densify 前计算权重分数（旧点在前 n_old）,
-                    # weight_prune_thr 表示剪枝比例(百分位), 实际阈值在 densify_and_prune 内用分位数确定。
-                    weight_scores = None
-                    weight_prune_thr = getattr(opt, "weight_prune_thr", 0.2)
-
-                    if gaussian_weight_accum is not None and gaussian_weight_accum.shape[0] == gaussians.get_xyz.shape[0]:
-                        valid = gaussian_weight_count > 0
-                        avg_scores = torch.ones(gaussian_weight_accum.shape[0], device="cuda")
-                        avg_scores[valid] = gaussian_weight_accum[valid] / gaussian_weight_count[valid]
-                        weight_scores = avg_scores
-                        gaussian_weight_accum = None
-                        gaussian_weight_count = None
+                    # ── 新剪枝：几何异常 + 贡献度近似（取代权重图剪枝）──
+                    # 贡献度近似用累计可见频次 visibility_count（旧点在前 n_old）。
+                    visibility_count = None
+                    if (gaussian_visibility_count is not None
+                            and gaussian_visibility_count.shape[0] == gaussians.get_xyz.shape[0]):
+                        visibility_count = gaussian_visibility_count
 
                     gaussians.densify_and_prune(
                         opt.densify_grad_threshold, 0.005,
                         scene.cameras_extent, size_threshold,
                         radii,
-                        weight_scores=weight_scores,
-                        weight_prune_thr=weight_prune_thr,
+                        aniso_thr=getattr(opt, "aniso_thr", 8.0),
+                        aniso_min_scale_ratio=getattr(opt, "aniso_min_scale_ratio", 0.001),
+                        contrib_prune_thr=getattr(opt, "contrib_prune_thr", 0.1),
+                        visibility_count=visibility_count,
                     )
+                    # 剪枝后可见频次计数失效（点集变了），重置
+                    gaussian_visibility_count = None
 
                 if iteration % opt.opacity_reset_interval == 0 or (
                     dataset.white_background and iteration == opt.densify_from_iter
@@ -417,6 +402,13 @@ if __name__ == "__main__":
                         help="预计算权重图目录名（位于 source_path 下）")
     parser.add_argument("--weight_densify_thr", type=float, default=0.3,
                         help="低于此权重的区域抑制 densification（0=不抑制）")
+    # ── 新剪枝参数 ──
+    parser.add_argument("--aniso_thr", type=float, default=8.0,
+                        help="各向异性比阈值(max/min scale), 超过则剪枝狭长 floater(0=关闭)")
+    parser.add_argument("--aniso_min_scale_ratio", type=float, default=0.001,
+                        help="各向异性剪枝的最小尺度保护(相对 scene_extent), 避免误伤细节点")
+    parser.add_argument("--contrib_prune_thr", type=float, default=0.1,
+                        help="贡献度剪枝比例(百分位), 剪掉可见频次×不透明度最低的比例(0=关闭)")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -431,6 +423,9 @@ if __name__ == "__main__":
     op_args.weight_map_beta = args.weight_map_beta
     op_args.weight_map_dir = args.weight_map_dir
     op_args.weight_densify_thr = args.weight_densify_thr
+    op_args.aniso_thr = args.aniso_thr
+    op_args.aniso_min_scale_ratio = args.aniso_min_scale_ratio
+    op_args.contrib_prune_thr = args.contrib_prune_thr
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(

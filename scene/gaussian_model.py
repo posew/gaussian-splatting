@@ -450,7 +450,22 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii,
-                          weight_scores=None, weight_prune_thr=0.0):
+                          aniso_thr=0.0, aniso_min_scale_ratio=0.0,
+                          contrib_prune_thr=0.0, visibility_count=None):
+        """
+        基于「几何异常 + 真实贡献度近似」的剪枝（取代原权重图剪枝）。
+
+        新增剪枝依据：
+          1. 各向异性剪枝 (aniso_thr)：剪掉又长又扁的针状 floater。
+             判据 = max(scale)/min(scale) > aniso_thr 且 该点绝对尺度不至于太小
+             （aniso_min_scale_ratio 用于避免误伤本就很小的细节点）。
+          2. 贡献度剪枝 (contrib_prune_thr)：用「可见频次 × 不透明度」近似每个
+             高斯的真实渲染贡献，剪掉长期低贡献的点。visibility_count 记录每个
+             旧高斯自上次剪枝以来被观测到（可见）的帧数。
+
+        说明：以上判据都基于高斯自身几何与实际贡献，不再依赖投影像素的权重图，
+        因此不会误伤图像模糊/远处但几何真实的点，也能真正抓住狭长 floater。
+        """
         n_old = self.get_xyz.shape[0]
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
@@ -465,36 +480,48 @@ class GaussianModel:
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
 
-        # 权重剪枝：百分位数自适应阈值
-        # weight_prune_thr 的语义 = 剪枝比例（例如 0.2 = 剪掉权重分数最低的 20% 高斯点）,
-        # 而非固定的绝对阈值。这样剪枝比例恒定可控, 不受权重图数值分布右偏的影响。
-        if weight_scores is not None and weight_prune_thr > 0:
-            n_current = self.get_xyz.shape[0]
+        # ── 新增剪枝逻辑（仅作用于旧点，densify 新增点在 n_old 之后不参与）──
+        n_current = self.get_xyz.shape[0]
+        scaling = self.get_scaling  # (N, 3)
+        opacity = self.get_opacity.squeeze(-1)  # (N,)
 
-            # 验证 weight_scores 长度是否与旧点数匹配（densify 只新增点, 旧点在前 n_old）
-            if weight_scores.shape[0] != n_old:
-                print(f"[WARNING] weight_scores shape mismatch: {weight_scores.shape[0]} vs n_old={n_old}, "
-                      f"skipping weight-based pruning")
+        # 1) 各向异性剪枝：针对狭长针状 floater
+        if aniso_thr and aniso_thr > 1.0:
+            smax = scaling.max(dim=1).values
+            smin = scaling.min(dim=1).values.clamp_min(1e-8)
+            aniso_ratio = smax / smin
+            aniso_mask = aniso_ratio > float(aniso_thr)
+            # 避免误伤尺度本就极小的细节点：仅当该点最大尺度不算太小才剪
+            if aniso_min_scale_ratio and aniso_min_scale_ratio > 0:
+                min_scale_abs = float(aniso_min_scale_ratio) * extent
+                aniso_mask = torch.logical_and(aniso_mask, smax > min_scale_abs)
+            prune_mask = torch.logical_or(prune_mask, aniso_mask)
+
+        # 2) 贡献度剪枝：可见频次 × 不透明度 近似真实贡献
+        if contrib_prune_thr and contrib_prune_thr > 0 and visibility_count is not None:
+            if visibility_count.shape[0] != n_old:
+                print(f"[WARNING] visibility_count shape mismatch: "
+                      f"{visibility_count.shape[0]} vs n_old={n_old}, skip contrib prune")
             else:
-                # 用分位数把 weight_prune_thr 当作"剪枝比例"转成实际阈值
-                ratio = min(max(float(weight_prune_thr), 0.0), 0.9)  # 限制最多剪 90%
-                old_scores = weight_scores[:n_old]
-                percentile_thr = torch.quantile(old_scores, ratio).item()
-
-                low_weight_mask = torch.zeros(n_current, dtype=torch.bool, device="cuda")
-                low_weight_mask[:n_old] = old_scores < percentile_thr
-
-                n_to_keep = (~low_weight_mask).sum().item()
-                if n_to_keep < 10:
-                    print(f"[WARNING] Percentile pruning would keep only {n_to_keep} points, skipping")
+                vis_norm = visibility_count.float()
+                vis_norm = vis_norm / (vis_norm.max() + 1e-8)  # 归一化到 [0,1]
+                contrib = vis_norm * opacity[:n_old]           # 贡献近似
+                ratio = min(max(float(contrib_prune_thr), 0.0), 0.9)
+                thr = torch.quantile(contrib, ratio).item()
+                low_contrib = torch.zeros(n_current, dtype=torch.bool, device="cuda")
+                low_contrib[:n_old] = contrib < thr
+                # 保护：不把点剪光
+                if (~torch.logical_or(prune_mask, low_contrib)).sum().item() >= 10:
+                    prune_mask = torch.logical_or(prune_mask, low_contrib)
                 else:
-                    prune_mask = torch.logical_or(prune_mask, low_weight_mask)
+                    print("[WARNING] contrib prune would keep <10 points, skip")
+        # ──────────────────────────────────────────────────────────────
 
         self.prune_points(prune_mask)
-        tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
         torch.cuda.empty_cache()
+        return prune_mask
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
