@@ -523,6 +523,40 @@ class GaussianModel:
         torch.cuda.empty_cache()
         return prune_mask
 
+    def prune_by_scene_clean(self, extent, clean_cfg, stage="both"):
+        """
+        v4: 用 GaussianLOD P6 场景净化方案剪枝。
+
+        Args:
+            extent: scene_extent (cameras_extent)
+            clean_cfg: scene.scene_cleaner.CleanConfig
+            stage: "attr" | "cluster" | "both"
+
+        Returns:
+            剔除的点数（int），0 表示未启用或未剔除任何点
+        """
+        from scene.scene_cleaner import compute_keep_mask
+        if not clean_cfg.enabled or self.get_xyz.shape[0] == 0:
+            return 0, {}
+        with torch.no_grad():
+            keep_mask, report = compute_keep_mask(
+                xyz=self.get_xyz.detach(),
+                opacity=self.get_opacity.squeeze(-1).detach(),
+                scale=self.get_scaling.detach(),
+                extent=float(extent),
+                cfg=clean_cfg,
+                stage=stage,
+            )
+            prune_mask = ~keep_mask
+            n_pruned = int(prune_mask.sum().item())
+            # 安全护栏：不能剪光
+            if n_pruned > 0 and (self.get_xyz.shape[0] - n_pruned) >= 10:
+                self.prune_points(prune_mask)
+                torch.cuda.empty_cache()
+            else:
+                n_pruned = 0
+        return n_pruned, report
+
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1

@@ -280,7 +280,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                         opt.densify_grad_threshold, 0.005,
                         scene.cameras_extent, size_threshold,
                         radii,
-                        aniso_thr=getattr(opt, "aniso_thr", 8.0),
+                        aniso_thr=getattr(opt, "aniso_thr", 0.0),
                         aniso_min_scale_ratio=getattr(opt, "aniso_min_scale_ratio", 0.001),
                         contrib_prune_thr=getattr(opt, "contrib_prune_thr", 0.0),
                         visibility_count=visibility_count,
@@ -288,11 +288,51 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                     # 剪枝后可见频次计数失效（点集变了），重置
                     gaussian_visibility_count = None
 
+                    # ── v4: 场景净化 Stage 1（属性预过滤，每次 densify 补一刀）──
+                    if getattr(opt, "clean_enabled", False):
+                        from scene.scene_cleaner import CleanConfig
+                        _clean_cfg_attr = CleanConfig(
+                            enabled=True,
+                            enable_attr=True,
+                            enable_cluster=False,
+                            min_opacity=float(getattr(opt, "clean_attr_min_opacity", 0.02)),
+                            max_scale_ratio=float(getattr(opt, "clean_attr_max_scale_ratio", 0.05)),
+                        )
+                        n_pruned, _ = gaussians.prune_by_scene_clean(
+                            scene.cameras_extent, _clean_cfg_attr, stage="attr",
+                        )
+                        if n_pruned > 0:
+                            print(f"[ITER {iteration}] clean-attr pruned {n_pruned}")
+                    # ──────────────────────────────────────────────────────
+
                 if iteration % opt.opacity_reset_interval == 0 or (
                     dataset.white_background and iteration == opt.densify_from_iter
                 ):
                     gaussians.reset_opacity()
             # ──────────────────────────────────────────────────────────
+
+            # ── v4: 场景净化 Stage 3（连通分量，训练末期低频触发）──
+            if (getattr(opt, "clean_enabled", False)
+                    and iteration >= int(getattr(opt, "clean_cluster_from_iter", 20000))
+                    and iteration % int(getattr(opt, "clean_cluster_interval", 5000)) == 0):
+                from scene.scene_cleaner import CleanConfig
+                _clean_cfg_cluster = CleanConfig(
+                    enabled=True,
+                    enable_attr=False,
+                    enable_cluster=True,
+                    min_cluster_size=int(getattr(opt, "clean_cluster_min_size", 64)),
+                    gap_to_main_ratio=float(getattr(opt, "clean_cluster_gap_ratio", 0.05)),
+                    eps_knn_multiplier=float(getattr(opt, "clean_cluster_eps_multiplier", 4.0)),
+                    max_points_for_graph=int(getattr(opt, "clean_cluster_max_points", 200000)),
+                )
+                n_pruned, rpt = gaussians.prune_by_scene_clean(
+                    scene.cameras_extent, _clean_cfg_cluster, stage="cluster",
+                )
+                if n_pruned > 0:
+                    print(f"[ITER {iteration}] clean-cluster pruned {n_pruned}, "
+                          f"clusters={rpt.get('cluster_count')}, main={rpt.get('main_count')}, "
+                          f"eps={rpt.get('eps_used')}")
+            # ──────────────────────────────────────────────────────
 
             if use_sparse_adam:
                 visible = radii > 0

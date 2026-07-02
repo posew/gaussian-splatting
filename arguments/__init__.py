@@ -100,10 +100,20 @@ class OptimizationParams(ParamGroup):
         self.weight_prune_thr = 0.2  # (deprecated) 旧权重图剪枝比例, 已弃用
         self.use_normal_loss = False
         self.lambda_normal = 0.01
-        # ── 新剪枝参数：几何异常 + 贡献度近似 ──
-        self.aniso_thr = 8.0               # 各向异性比阈值, max/min scale 超过则视为狭长 floater
+        # ── 剪枝参数：v3 各向异性剪枝（v4 默认关闭）──
+        self.aniso_thr = 0.0               # v4: 关闭各向异性剪枝（>1.0 时才生效）
         self.aniso_min_scale_ratio = 0.001 # 各向异性剪枝的最小尺度保护(相对 scene_extent)
-        self.contrib_prune_thr = 0.0  # v3: 关闭贡献度剪枝, 只保留各向异性剪枝       # 贡献度剪枝比例(百分位), 剪掉贡献最低的 10%
+        self.contrib_prune_thr = 0.0       # v3: 关闭贡献度剪枝
+        # ── v4: 场景净化剪枝（GaussianLOD P6 方案的训练时轻量集成版）──
+        self.clean_enabled = True          # v4 总开关：是否启用场景净化
+        self.clean_attr_min_opacity = 0.02 # Stage 1: opacity 阈值
+        self.clean_attr_max_scale_ratio = 0.05  # Stage 1: 巨型片阈值 (× extent)
+        self.clean_cluster_from_iter = 20000    # Stage 3 起始 iter (末期才跑)
+        self.clean_cluster_interval = 5000      # Stage 3 触发间隔
+        self.clean_cluster_min_size = 64        # Stage 3: 小簇阈值
+        self.clean_cluster_gap_ratio = 0.05     # Stage 3: 到主簇最近距离阈值 (× extent)
+        self.clean_cluster_eps_multiplier = 4.0 # Stage 3: 自适应 ε = median(1-NN) × 该倍数
+        self.clean_cluster_max_points = 200000  # Stage 3: 建图前的子采样上限
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
