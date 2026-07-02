@@ -551,6 +551,10 @@ class GaussianModel:
             n_pruned = int(prune_mask.sum().item())
             # 安全护栏：不能剪光
             if n_pruned > 0 and (self.get_xyz.shape[0] - n_pruned) >= 10:
+                # tmp_radii 兜底：gs 版 prune_points 硬索引 self.tmp_radii,
+                # 而 Stage3 在 densify 之外调用时 tmp_radii 可能为 None
+                if getattr(self, "tmp_radii", None) is None:
+                    self.tmp_radii = torch.zeros(self.get_xyz.shape[0], device=self.get_xyz.device)
                 self.prune_points(prune_mask)
                 torch.cuda.empty_cache()
             else:

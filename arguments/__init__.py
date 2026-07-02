@@ -108,6 +108,9 @@ class OptimizationParams(ParamGroup):
         self.clean_enabled = True          # v4 总开关：是否启用场景净化
         self.clean_attr_min_opacity = 0.02 # Stage 1: opacity 阈值
         self.clean_attr_max_scale_ratio = 0.05  # Stage 1: 巨型片阈值 (× extent)
+        # v4b: Stage1 节流（避免每次 densify 都触发导致过剪）
+        self.clean_attr_from_iter = 3000        # Stage 1 起始 iter
+        self.clean_attr_every = 10              # Stage 1 每 N 次 densify 才触发一次
         self.clean_cluster_from_iter = 20000    # Stage 3 起始 iter (末期才跑)
         self.clean_cluster_interval = 5000      # Stage 3 触发间隔
         self.clean_cluster_min_size = 64        # Stage 3: 小簇阈值

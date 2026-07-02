@@ -288,8 +288,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                     # 剪枝后可见频次计数失效（点集变了），重置
                     gaussian_visibility_count = None
 
-                    # ── v4: 场景净化 Stage 1（属性预过滤，每次 densify 补一刀）──
-                    if getattr(opt, "clean_enabled", False):
+                    # ── v4b: 场景净化 Stage 1（属性预过滤，节流后每 N 次 densify 才触发一次）──
+                    _attr_from = int(getattr(opt, "clean_attr_from_iter", 3000))
+                    _attr_every = max(1, int(getattr(opt, "clean_attr_every", 10)))
+                    _attr_period = opt.densification_interval * _attr_every
+                    if (getattr(opt, "clean_enabled", False)
+                            and iteration >= _attr_from
+                            and iteration % _attr_period == 0):
                         from scene.scene_cleaner import CleanConfig
                         _clean_cfg_attr = CleanConfig(
                             enabled=True,
