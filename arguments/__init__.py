@@ -105,7 +105,7 @@ class OptimizationParams(ParamGroup):
         self.aniso_min_scale_ratio = 0.001 # 各向异性剪枝的最小尺度保护(相对 scene_extent)
         self.contrib_prune_thr = 0.0       # v3: 关闭贡献度剪枝
         # ── v4: 场景净化剪枝（GaussianLOD P6 方案的训练时轻量集成版）──
-        self.clean_enabled = True          # v4 总开关：是否启用场景净化
+        self.clean_enabled = False         # v4b 之后默认关闭；场景净化路径已证明不 work
         self.clean_attr_min_opacity = 0.02 # Stage 1: opacity 阈值
         self.clean_attr_max_scale_ratio = 0.05  # Stage 1: 巨型片阈值 (× extent)
         # v4b: Stage1 节流（避免每次 densify 都触发导致过剪）
