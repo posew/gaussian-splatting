@@ -97,6 +97,13 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        # -- opacity suppression (early-stage clamp) --
+        # 前 opacity_suppress_end_ratio 比例的迭代中，将所有高斯 opacity
+        # 硬 clamp 到 <= opacity_suppress_max，用于抑制早期狭长/噪声高斯。
+        # 参考思路：训练早期压制透明度，让只有跨视角一致累积梯度的高斯才能"点亮"。
+        # 上限 0.1 与 create_from_pcd 初始 opacity 一致（inverse_sigmoid(0.1)）。
+        self.opacity_suppress_end_ratio = 0.0  # 0 = 关闭；例如 0.4 = 前 40% iter 生效
+        self.opacity_suppress_max = 0.1        # clamp 上限（activation 后的值）
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

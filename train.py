@@ -16,7 +16,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state, get_expon_lr_func
+from utils.general_utils import safe_state, get_expon_lr_func, inverse_sigmoid
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -60,8 +60,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
+    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+
+    # -- opacity suppression (early-stage clamp) --
+    # 若 opacity_suppress_end_ratio > 0，则在前该比例迭代内把 _opacity(logit) clamp 到
+    # inverse_sigmoid(opacity_suppress_max) 以下，即 sigmoid 后 <= opacity_suppress_max
+    opacity_suppress_end_iter = int(opt.iterations * opt.opacity_suppress_end_ratio)
+    opacity_suppress_logit_max = None
+    if opacity_suppress_end_iter > 0:
+        # inverse_sigmoid 需要输入是 tensor
+        opacity_suppress_logit_max = float(
+            inverse_sigmoid(torch.tensor(opt.opacity_suppress_max, dtype=torch.float, device="cuda")).item()
+        )
+        print(f"[opacity-suppress] enabled: clamp _opacity <= inverse_sigmoid({opt.opacity_suppress_max}) = {opacity_suppress_logit_max:.4f}, for iter <= {opacity_suppress_end_iter}")
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -184,6 +196,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+
+                # -- opacity suppression: clamp after optimizer step --
+                if opacity_suppress_logit_max is not None and iteration <= opacity_suppress_end_iter:
+                    gaussians._opacity.data.clamp_(max=opacity_suppress_logit_max)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
