@@ -97,6 +97,13 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        # -- weight-map loss (loss-only variant) --
+        # 只把 L1 loss 乘上可信度权重图，其他任何地方都不改（densify / prune / SSIM 均不动）
+        # W(x) = sharpness(x)^alpha * UDCP_transmission(x)^beta，归一化到 [0, 1]
+        self.use_weight_map = False            # 是否启用
+        self.weight_map_mode = "online"        # "online" | "precomputed"
+        self.weight_map_alpha = 1.0            # 清晰度指数
+        self.weight_map_beta = 1.0             # UDCP 传输率指数
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

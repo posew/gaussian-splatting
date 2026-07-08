@@ -17,6 +17,7 @@ from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
+from utils.weight_map_utils import WeightMapLoader
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -60,8 +61,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
+    use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+
+    # ------ weight-map loss (loss-only variant) ------
+    # 只在 L1 loss 上乘一个可信度权重图，其他任何地方都不改（densify / prune / SSIM 均不动）
+    # 权重图 W(x) = 清晰度^alpha * UDCP 传输率^beta，归一化到 [0, 1]
+    weight_map_loader = None
+    if opt.use_weight_map:
+        weight_map_loader = WeightMapLoader(
+            source_path=dataset.source_path,
+            mode=opt.weight_map_mode,
+            alpha=opt.weight_map_alpha,
+            beta=opt.weight_map_beta,
+        )
+        print(f"[weightmap-loss-only] Enabled: mode={opt.weight_map_mode}, alpha={opt.weight_map_alpha}, beta={opt.weight_map_beta}")
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -117,7 +131,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
+        if weight_map_loader is not None:
+            weight_map = weight_map_loader.get(viewpoint_cam, device=image.device)
+            # 关键一行：仅在 L1 上加权，SSIM 完全不动
+            Ll1 = (weight_map * torch.abs(image - gt_image)).mean()
+        else:
+            Ll1 = l1_loss(image, gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
