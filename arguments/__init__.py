@@ -104,6 +104,10 @@ class OptimizationParams(ParamGroup):
         self.weight_map_mode = "online"        # "online" | "precomputed"
         self.weight_map_alpha = 1.0            # 清晰度指数
         self.weight_map_beta = 1.0             # UDCP 传输率指数
+        # -- 各向异性正则 (aniso reg) --
+        # 惩罚 max_scale/min_scale 超过 anchor 的高斯，压制细长针状伪影。
+        self.lambda_aniso = 0.0                # 正则强度（0 = 关闭）
+        self.aniso_anchor = 10.0               # 比例阈值，超过才开始被惩罚
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

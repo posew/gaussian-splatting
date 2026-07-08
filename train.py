@@ -144,6 +144,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
+        # ── 各向异性正则 (aniso reg) ─────────────────────────────────
+        # 惩罚"细长针状"高斯：只对 max_scale/min_scale 超过 anchor 的部分产生 loss。
+        # 目的：在保留大部分几何自由度的前提下，压掉水下场景常见的细长伪影。
+        # 参数：
+        #   lambda_aniso  = 正则强度（0 = 关闭）
+        #   aniso_anchor  = 阈值，超过此比例才开始被惩罚（推荐 5~15）
+        aniso_loss_val = 0.0
+        if getattr(opt, "lambda_aniso", 0.0) > 0.0:
+            scales = gaussians.get_scaling  # (N, 3) 已经过 exp，是真实 scale
+            s_max = scales.max(dim=1).values
+            s_min = scales.min(dim=1).values.clamp(min=1e-6)
+            ratio = s_max / s_min  # (N,)
+            anchor = getattr(opt, "aniso_anchor", 10.0)
+            aniso_loss = (ratio - anchor).clamp(min=0.0).mean()
+            loss = loss + opt.lambda_aniso * aniso_loss
+            aniso_loss_val = aniso_loss.item()
+        # ──────────────────────────────────────────────────────────────
+
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
@@ -168,7 +186,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                postfix = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"}
+                if getattr(opt, "lambda_aniso", 0.0) > 0.0:
+                    postfix["Aniso"] = f"{aniso_loss_val:.4f}"
+                progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
