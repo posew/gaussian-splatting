@@ -188,7 +188,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
+
+                    # ── 定向 aniso 剪枝 ────────────────────────────────
+                    # 紧跟 upstream densify_and_prune 之后，额外剪掉极端细长的高斯（纸片/针状伪影）。
+                    # 与 aniso 正则不同：这里是"直接删除"而不是"撑圆"，因此不会产生膨胀伪影。
+                    # 参数：
+                    #   aniso_prune_ratio  = 触发阈值 (max_scale/min_scale > 此值即剪)
+                    #   aniso_prune_from   = 从第几步开始参与 (与 densify_from_iter 独立)
+                    #   aniso_prune_until  = 到第几步停止 (默认与 densify_until_iter 一致)
+                    if getattr(opt, "aniso_prune_ratio", 0.0) > 0.0 \
+                            and iteration >= getattr(opt, "aniso_prune_from", opt.densify_from_iter) \
+                            and iteration <= getattr(opt, "aniso_prune_until", opt.densify_until_iter):
+                        scales = gaussians.get_scaling  # (N, 3) 真实 scale
+                        s_max = scales.max(dim=1).values
+                        s_min = scales.min(dim=1).values.clamp(min=1e-6)
+                        ratio = s_max / s_min
+                        aniso_mask = ratio > opt.aniso_prune_ratio  # True = 要剪
+                        if aniso_mask.any():
+                            # prune_points 会访问 self.tmp_radii, 但 densify_and_prune 结束时已置 None, 补一个假的
+                            gaussians.tmp_radii = torch.zeros(gaussians.get_xyz.shape[0], device="cuda")
+                            n_before = gaussians.get_xyz.shape[0]
+                            gaussians.prune_points(aniso_mask)
+                            gaussians.tmp_radii = None
+                            n_after = gaussians.get_xyz.shape[0]
+                            if iteration % 500 == 0:  # 少量打印
+                                print(f"[aniso-prune] iter={iteration} pruned {n_before - n_after} / {n_before} ({(n_before-n_after)/n_before*100:.2f}%) points with ratio>{opt.aniso_prune_ratio}")
+                    # ──────────────────────────────────────────────────
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 

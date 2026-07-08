@@ -104,6 +104,11 @@ class OptimizationParams(ParamGroup):
         self.weight_map_mode = "online"        # "online" | "precomputed"
         self.weight_map_alpha = 1.0            # 清晰度指数
         self.weight_map_beta = 1.0             # UDCP 传输率指数
+        # -- 定向 aniso 剪枝 (aniso prune) --
+        # 每次 densify_and_prune 之后, 直接删除 max_scale/min_scale > ratio 的针状/纸片高斯.
+        self.aniso_prune_ratio = 0.0           # 触发阈值 (0 = 关闭)
+        self.aniso_prune_from = 500            # 从第几步开始 (默认同 densify_from_iter)
+        self.aniso_prune_until = 15000         # 到第几步停 (默认同 densify_until_iter)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
