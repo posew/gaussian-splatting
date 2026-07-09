@@ -472,14 +472,22 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def add_densification_stats_weighted(self, viewspace_point_tensor, update_filter, per_gaussian_weight):
+    def add_densification_stats_weighted(self, viewspace_point_tensor, update_filter, per_gaussian_weight, denom_mode="soft"):
         """
         权重图门控版本的 densify 统计.
         per_gaussian_weight: (N,) tensor in [0, 1], 表示每个高斯在当前视图下的可信度权重.
-        权重低 (水体/远处/失焦) 的高斯, 其梯度累积和分母都按权重折扣,
-        使其达到 densify 触发阈值的机会更小 —— 从源头抑制无用漂浮高斯的产生.
+        denom_mode:
+            "soft" (C1, 原实现): denom += w. 分子分母同乘 w, 但 densify 判据比的是
+                                 平均梯度 = sum(w*g)/sum(w), 小 w 区域 denom 塌缩反而
+                                 放大平均梯度 -> 结果是"精细化"而非"抑制", 实测点云反涨.
+            "hard" (C1a, 修正版): denom += 1. 只折扣分子, 分母按真实观察次数计.
+                                  平均梯度 = sum(w*g)/N ≈ w_mean*g_mean, 小 w 区域被真实
+                                  压低, 更难触发 densify 阈值 -> 从源头抑制水体高斯.
         """
         w = per_gaussian_weight[update_filter].unsqueeze(-1)  # (M, 1)
         grad = torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)
         self.xyz_gradient_accum[update_filter] += w * grad
-        self.denom[update_filter] += w  # 分母也折扣, 避免小权重视图反而拉低平均梯度
+        if denom_mode == "hard":
+            self.denom[update_filter] += 1
+        else:  # "soft"
+            self.denom[update_filter] += w

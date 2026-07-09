@@ -109,6 +109,10 @@ class OptimizationParams(ParamGroup):
         # 更难达到 densify 触发阈值, 从"生成端"抑制无用漂浮高斯的产生.
         # 需要同时开启 use_weight_map (复用 loader 与 mode/alpha/beta).
         self.use_weight_map_densify_gate = False
+        # densify gate 的分母折扣模式:
+        #   "soft" (C1, 默认): denom += w  分子分母同折扣, 实测小 w 区域反被放大 -> 精细化 (点云反涨)
+        #   "hard" (C1a)     : denom += 1  只折扣分子, 小 w 区域被真实压低 -> 抑制 (预期方向)
+        self.densify_gate_denom_mode = "soft"
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

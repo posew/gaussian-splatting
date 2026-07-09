@@ -77,7 +77,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
         print(f"[weightmap-loss-only] Enabled: mode={opt.weight_map_mode}, alpha={opt.weight_map_alpha}, beta={opt.weight_map_beta}")
         if opt.use_weight_map_densify_gate:
-            print(f"[weightmap-densify-gate] Enabled: per-pixel weight discounts xyz_gradient_accum & denom")
+            print(f"[weightmap-densify-gate] Enabled: denom_mode={opt.densify_gate_denom_mode} "
+                  f"(soft=denom+=w [C1, 精细化], hard=denom+=1 [C1a, 真正抑制])")
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -204,7 +205,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     v = ((p_ndc[:, 1] + 1.0) * 0.5 * H).long().clamp(0, H - 1)
                     per_g_weight = wmap2d[v, u].detach()                        # (N,)
                     gaussians.add_densification_stats_weighted(
-                        viewspace_point_tensor, visibility_filter, per_g_weight
+                        viewspace_point_tensor, visibility_filter, per_g_weight,
+                        denom_mode=opt.densify_gate_denom_mode,
                     )
                 else:
                     gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
