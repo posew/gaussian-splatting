@@ -76,6 +76,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             beta=opt.weight_map_beta,
         )
         print(f"[weightmap-loss-only] Enabled: mode={opt.weight_map_mode}, alpha={opt.weight_map_alpha}, beta={opt.weight_map_beta}")
+        if opt.use_weight_map_densify_gate:
+            print(f"[weightmap-densify-gate] Enabled: per-pixel weight discounts xyz_gradient_accum & denom")
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -131,6 +133,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+        weight_map = None  # 提到外层, 供后续 densify gate 复用
         if weight_map_loader is not None:
             weight_map = weight_map_loader.get(viewpoint_cam, device=image.device)
             # 关键一行：仅在 L1 上加权，SSIM 完全不动
@@ -183,7 +186,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                # ---- Phase C1: 权重图门控的 densify 梯度累积 ----
+                # 若启用, 每个可见高斯投影到屏幕像素后查权重图, 用该权重折扣它累积到
+                # xyz_gradient_accum / denom 的量, 让低置信度区域的高斯从"生成端"就被抑制.
+                if opt.use_weight_map_densify_gate and weight_map is not None:
+                    means3D = gaussians.get_xyz  # (N, 3)
+                    N = means3D.shape[0]
+                    ones = torch.ones(N, 1, device=means3D.device, dtype=means3D.dtype)
+                    pts_h = torch.cat([means3D, ones], dim=1)                  # (N, 4)
+                    p_clip = pts_h @ viewpoint_cam.full_proj_transform         # (N, 4)
+                    w_clip = p_clip[:, 3:4].clamp(min=1e-6)
+                    p_ndc = p_clip[:, :3] / w_clip                             # (N, 3)
+                    # weight_map 形状: (1, H, W) 或 (H, W)
+                    wmap2d = weight_map.squeeze(0) if weight_map.dim() == 3 else weight_map
+                    H, W = wmap2d.shape[-2], wmap2d.shape[-1]
+                    u = ((p_ndc[:, 0] + 1.0) * 0.5 * W).long().clamp(0, W - 1)
+                    v = ((p_ndc[:, 1] + 1.0) * 0.5 * H).long().clamp(0, H - 1)
+                    per_g_weight = wmap2d[v, u].detach()                        # (N,)
+                    gaussians.add_densification_stats_weighted(
+                        viewspace_point_tensor, visibility_filter, per_g_weight
+                    )
+                else:
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None

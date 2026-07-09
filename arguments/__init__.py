@@ -104,6 +104,11 @@ class OptimizationParams(ParamGroup):
         self.weight_map_mode = "online"        # "online" | "precomputed"
         self.weight_map_alpha = 1.0            # 清晰度指数
         self.weight_map_beta = 1.0             # UDCP 传输率指数
+        # -- weight-map densify gate (Phase C1) --
+        # 用像素级权重图折扣 densify 梯度累积: 低置信区域 (水体/远处/失焦) 的高斯
+        # 更难达到 densify 触发阈值, 从"生成端"抑制无用漂浮高斯的产生.
+        # 需要同时开启 use_weight_map (复用 loader 与 mode/alpha/beta).
+        self.use_weight_map_densify_gate = False
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
