@@ -406,7 +406,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, split_long_ratio=0.0):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -414,6 +414,19 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+
+        # 强制劈开细长高斯 (split_long_ratio > 0 时启用)
+        # 目的: 长宽比大的高斯很可能是"悬臂/拉皮筋", 覆盖多视图不一致的补偿点.
+        # 强制原地劈成两个短的, 让优化器不能靠"拉长自己"取巧, 只能真正建模两个不同表面点.
+        if split_long_ratio > 0.0:
+            scales = self.get_scaling
+            ratio = scales.max(dim=1).values / scales.min(dim=1).values.clamp(min=1e-6)
+            long_mask = ratio > split_long_ratio
+            n_long = int(long_mask.sum().item())
+            n_grad = int(selected_pts_mask.sum().item())
+            selected_pts_mask = torch.logical_or(selected_pts_mask, long_mask)
+            n_total = int(selected_pts_mask.sum().item())
+            print(f"[split_long] ratio>{split_long_ratio}: {n_long}  |  grad_only: {n_grad}  |  union split: {n_total}  |  N_all: {n_init_points}")
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -449,13 +462,13 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, split_long_ratio=0.0):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.tmp_radii = radii
         self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_split(grads, max_grad, extent, split_long_ratio=split_long_ratio)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:

@@ -104,6 +104,13 @@ class OptimizationParams(ParamGroup):
         self.weight_map_mode = "online"        # "online" | "precomputed"
         self.weight_map_alpha = 1.0            # 清晰度指数
         self.weight_map_beta = 1.0             # UDCP 传输率指数
+        # -- 强制劈开细长高斯 (split_long) --
+        # 每次 densify 时, 检查所有高斯的长宽比 max_scale/min_scale,
+        # 超过 split_long_ratio 的无条件加入 split 名单 (原地劈成两个短的).
+        # 目的: 破解"悬臂/拉皮筋"高斯 —— 这类高斯是优化器为了同时覆盖多视图不一致的
+        # 观测点而拉长的, 强制劈开后逼它建两个独立的短高斯来分别拟合各自的视图.
+        # 0.0 表示禁用 (默认). 常用起点值 10, 越小越激进.
+        self.split_long_ratio = 0.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

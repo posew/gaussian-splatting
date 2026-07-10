@@ -76,6 +76,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             beta=opt.weight_map_beta,
         )
         print(f"[weightmap-loss-only] Enabled: mode={opt.weight_map_mode}, alpha={opt.weight_map_alpha}, beta={opt.weight_map_beta}")
+    if getattr(opt, "split_long_ratio", 0.0) > 0.0:
+        print(f"[split_long] Enabled: 每次 densify 强制劈开长宽比 > {opt.split_long_ratio} 的高斯")
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -187,7 +189,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii,
+                                                split_long_ratio=getattr(opt, "split_long_ratio", 0.0))
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
