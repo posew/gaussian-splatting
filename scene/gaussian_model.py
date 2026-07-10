@@ -418,22 +418,47 @@ class GaussianModel:
         # 强制劈开细长高斯 (split_long_ratio > 0 时启用)
         # 目的: 长宽比大的高斯很可能是"悬臂/拉皮筋", 覆盖多视图不一致的补偿点.
         # 强制原地劈成两个短的, 让优化器不能靠"拉长自己"取巧, 只能真正建模两个不同表面点.
+        long_in_selected = None
         if split_long_ratio > 0.0:
-            scales = self.get_scaling
-            ratio = scales.max(dim=1).values / scales.min(dim=1).values.clamp(min=1e-6)
-            long_mask = ratio > split_long_ratio
+            scales_all = self.get_scaling
+            ratio_all = scales_all.max(dim=1).values / scales_all.min(dim=1).values.clamp(min=1e-6)
+            long_mask = ratio_all > split_long_ratio
             n_long = int(long_mask.sum().item())
             n_grad = int(selected_pts_mask.sum().item())
             selected_pts_mask = torch.logical_or(selected_pts_mask, long_mask)
             n_total = int(selected_pts_mask.sum().item())
+            # 保存哪些"选中的高斯"是因为 long 触发的 (用于后面单独压长轴)
+            long_in_selected = long_mask[selected_pts_mask]
             print(f"[split_long] ratio>{split_long_ratio}: {n_long}  |  grad_only: {n_grad}  |  union split: {n_total}  |  N_all: {n_init_points}")
+
+        # 原始 scale (激活后, 真实尺寸空间), shape=(K, 3), K = 选中数
+        base_scale = self.get_scaling[selected_pts_mask]
+
+        # ---- 方向 B: 对 long 触发的行, 把长轴 scale 压到 = 中轴 scale ----
+        # 这样劈完的新高斯长宽比 = median/min, 大概率 < split_long_ratio, 下 iter 不再触发.
+        # 只压长轴一根, 中/短轴保持原样, 形状表达能力破坏最小.
+        if long_in_selected is not None and long_in_selected.any():
+            # 按行取 median (三维里 median = 中间那根)
+            sorted_scale, _ = torch.sort(base_scale, dim=1)   # 升序: [min, median, max]
+            median_scale = sorted_scale[:, 1]                  # (K,)
+            argmax_axis = base_scale.argmax(dim=1)             # (K,) 每行最长轴的 index
+            # 只对 long 行改
+            row_idx = torch.nonzero(long_in_selected, as_tuple=False).squeeze(1)
+            col_idx = argmax_axis[row_idx]
+            target_val = median_scale[row_idx]   # 目标: 把长轴缩到 = 中轴
+            # 就地把 base_scale 的 (long 行, 长轴列) 覆盖为 median
+            base_scale = base_scale.clone()
+            base_scale[row_idx, col_idx] = target_val
+            n_shrunk = int(row_idx.numel())
+            print(f"[split_long] shrink long-axis to median on {n_shrunk} rows before /1.6 split")
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        # 用可能被压过长轴的 base_scale (而不是 self.get_scaling[...]) 生成新 scale
+        new_scaling = self.scaling_inverse_activation(base_scale.repeat(N,1) / (0.8*N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
