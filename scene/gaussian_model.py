@@ -488,6 +488,14 @@ class GaussianModel:
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
+        # [W1 densify-guide] 用 per-gaussian avg_wm 缩放 grads
+        # 高 wm 区(物体) grad 不打折 → 更容易过 grad_threshold → 优先 densify
+        # 低 wm 区(水体) grad × 0.3 保底 → 慢一点但不完全断
+        # 与 minisplat 硬门槛 vis_weights > thr 的区别: 这是软加权, 保留背景 densify 能力
+        if self.wm_denom.sum() > 0:
+            avg_wm = self.wm_accum / self.wm_denom.clamp(min=1)
+            grads = grads * avg_wm.clamp(min=0.3, max=1.0)
+
         self.tmp_radii = radii
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
