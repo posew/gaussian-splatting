@@ -492,7 +492,19 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
+        # opacity 剪枝: low opacity 的高斯被 prune
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+
+        # [W2 prune-guard] 高 wm 区高斯豁免 opacity 剪枝 (但仍受尺寸剪枝约束)
+        # 动机: 高 wm 区刚 densify 出的新高斯 opacity 初始低, 若立即剪掉则失去物体细节
+        #      水体 (低 wm) 保持原始 opacity_prune 行为不变
+        # 阈值 0.5 与 v11/v12 的 HIGH/LOW 判定阈值一致
+        if self.wm_denom.sum() > 0:
+            avg_wm = (self.wm_accum / self.wm_denom.clamp(min=1)).squeeze()
+            high_wm_gs = avg_wm >= 0.5
+            prune_mask = prune_mask & (~high_wm_gs)  # 高 wm 且低 opacity → 保留
+
+        # 尺寸剪枝: 过大的高斯必须剪 (安全阈值), 高 wm 也不豁免
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
