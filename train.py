@@ -199,12 +199,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                     wm_view.unsqueeze(0), size=(H_img, W_img),
                                     mode="bilinear", align_corners=False
                                 ).squeeze(0)
-                            pts2d = viewspace_point_tensor[visibility_filter]
+                            # 注意: render() 返回的 visibility_filter = (radii > 0).nonzero()
+                            #       shape 是 (N_vis, 1) 索引 tensor, 不是 bool mask
+                            #       需 squeeze 成 1D 索引才能正常做 pts2d[:, 0]
+                            vis_idx = visibility_filter.squeeze(-1) if visibility_filter.dim() == 2 else visibility_filter
+                            pts2d = viewspace_point_tensor[vis_idx]  # (N_vis, 3)
                             # NDC ∈ [-1, 1] → pixel ∈ [0, W-1] / [0, H-1]
                             px = ((pts2d[:, 0] + 1.0) * 0.5 * W_img).long().clamp(0, W_img - 1)
                             py = ((pts2d[:, 1] + 1.0) * 0.5 * H_img).long().clamp(0, H_img - 1)
                             vis_wm = wm_view[0, py, px].unsqueeze(1)  # (N_vis, 1)
-                            gaussians.add_wm_stats(vis_wm, visibility_filter)
+                            gaussians.add_wm_stats(vis_wm, vis_idx)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
