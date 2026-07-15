@@ -60,6 +60,11 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        # [wm-accum-base] per-gaussian wm accumulator
+        # 每步用 viewspace 2D 投影 sample wm map, 累加到对应高斯上
+        # avg_wm = wm_accum / wm_denom.clamp(min=1) 供 W1(densify 引导) / W2(prune 反向引导) 使用
+        self.wm_accum = torch.empty(0)
+        self.wm_denom = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -77,6 +82,8 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
+            self.wm_accum,
+            self.wm_denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
@@ -90,13 +97,17 @@ class GaussianModel:
         self._rotation, 
         self._opacity,
         self.max_radii2D, 
-        xyz_gradient_accum, 
+        xyz_gradient_accum,
         denom,
-        opt_dict, 
+        wm_accum,
+        wm_denom,
+        opt_dict,
         self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
+        self.wm_accum = wm_accum
+        self.wm_denom = wm_denom
         self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -179,6 +190,9 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # [wm-accum-base] 初始化 per-gaussian wm accumulator (与 xyz_gradient_accum 同 shape)
+        self.wm_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.wm_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -360,6 +374,9 @@ class GaussianModel:
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
+        # [wm-accum-base] 跟随 prune 保留有效行 (per-gaussian buffer 必须与 _xyz 同 shape)
+        self.wm_accum = self.wm_accum[valid_points_mask]
+        self.wm_denom = self.wm_denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
 
@@ -385,7 +402,8 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii,
+                              new_wm_accum=None, new_wm_denom=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -404,6 +422,15 @@ class GaussianModel:
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # [wm-accum-base] wm_accum/wm_denom 不重置, 保留累积历史 + 拼接新高斯的初始值
+        # 新高斯若无 wm 先验则用 0 (兼容旧调用), 否则继承父高斯的 avg_wm × 1 次采样等效
+        N_new = new_xyz.shape[0]
+        if new_wm_accum is None:
+            new_wm_accum = torch.zeros((N_new, 1), device="cuda")
+        if new_wm_denom is None:
+            new_wm_denom = torch.zeros((N_new, 1), device="cuda")
+        self.wm_accum = torch.cat([self.wm_accum, new_wm_accum], dim=0)
+        self.wm_denom = torch.cat([self.wm_denom, new_wm_denom], dim=0)
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
@@ -426,8 +453,12 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        # [wm-accum-base] 新高斯继承父高斯的 wm 累积 (作为先验), 数量重复 N 份
+        new_wm_accum = self.wm_accum[selected_pts_mask].repeat(N, 1)
+        new_wm_denom = self.wm_denom[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii,
+                                   new_wm_accum=new_wm_accum, new_wm_denom=new_wm_denom)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -446,8 +477,12 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        # [wm-accum-base] clone 出的新高斯继承父高斯的 wm 累积
+        new_wm_accum = self.wm_accum[selected_pts_mask]
+        new_wm_denom = self.wm_denom[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii,
+                                   new_wm_accum=new_wm_accum, new_wm_denom=new_wm_denom)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
@@ -471,3 +506,12 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def add_wm_stats(self, vis_wm_values, update_filter):
+        """
+        [wm-accum-base] per-gaussian wm 累加
+        vis_wm_values: (N_vis, 1) 当前视图下每个可见高斯 sample 到的 wm 值
+        update_filter: (N,) bool, 长度 = 高斯总数, True 表示当前视图可见
+        """
+        self.wm_accum[update_filter] += vis_wm_values
+        self.wm_denom[update_filter] += 1

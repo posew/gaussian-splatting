@@ -185,6 +185,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
+                # [wm-accum-base] per-gaussian wm 累加: 用 viewspace 2D 投影 sample wm map
+                # 每高斯 1 个采样点, 落在 wm 上的位置代表这个高斯"被看到的位置"的 wm 值
+                # 供 W1(densify 引导) / W2(prune 反向引导) 分支使用; base 分支只累加不消费
+                if weight_map_loader is not None:
+                    with torch.no_grad():
+                        wm_view = weight_map_loader.get(viewpoint_cam, device=image.device)
+                        if wm_view is not None:
+                            H_img, W_img = image.shape[1], image.shape[2]
+                            if wm_view.shape[1] != H_img or wm_view.shape[2] != W_img:
+                                import torch.nn.functional as F_interp
+                                wm_view = F_interp.interpolate(
+                                    wm_view.unsqueeze(0), size=(H_img, W_img),
+                                    mode="bilinear", align_corners=False
+                                ).squeeze(0)
+                            pts2d = viewspace_point_tensor[visibility_filter]
+                            # NDC ∈ [-1, 1] → pixel ∈ [0, W-1] / [0, H-1]
+                            px = ((pts2d[:, 0] + 1.0) * 0.5 * W_img).long().clamp(0, W_img - 1)
+                            py = ((pts2d[:, 1] + 1.0) * 0.5 * H_img).long().clamp(0, H_img - 1)
+                            vis_wm = wm_view[0, py, px].unsqueeze(1)  # (N_vis, 1)
+                            gaussians.add_wm_stats(vis_wm, visibility_filter)
+
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
