@@ -65,8 +65,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
     # ------ weight-map loss (loss-only variant) ------
-    # 只在 L1 loss 上乘一个可信度权重图，其他任何地方都不改（densify / prune / SSIM 均不动）
-    # 权重图 W(x) = 清晰度^alpha * UDCP 传输率^beta，归一化到 [0, 1]
+    # 只在 L1 loss 上乘一个可信度权重图, 其他任何地方都不改 (densify / prune / SSIM 均不动)
+    # method="kmeans" (默认, mini v7 移植): Lab K-means 颜色聚类 + 类内 LocVar mean
+    # method="legacy" (老公式): W(x) = 清晰度^alpha * UDCP 传输率^beta
     weight_map_loader = None
     if opt.use_weight_map:
         weight_map_loader = WeightMapLoader(
@@ -74,8 +75,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mode=opt.weight_map_mode,
             alpha=opt.weight_map_alpha,
             beta=opt.weight_map_beta,
+            method=opt.weight_map_method,
+            kmeans_k=opt.weight_map_kmeans_k,
         )
-        print(f"[weightmap-loss-only] Enabled: mode={opt.weight_map_mode}, alpha={opt.weight_map_alpha}, beta={opt.weight_map_beta}")
+        print(
+            f"[weightmap-loss-only] Enabled: mode={opt.weight_map_mode}, "
+            f"method={opt.weight_map_method}, kmeans_k={opt.weight_map_kmeans_k}, "
+            f"alpha={opt.weight_map_alpha}, beta={opt.weight_map_beta}"
+        )
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))

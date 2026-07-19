@@ -98,12 +98,15 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.optimizer_type = "default"
         # -- weight-map loss (loss-only variant) --
-        # 只把 L1 loss 乘上可信度权重图，其他任何地方都不改（densify / prune / SSIM 均不动）
-        # W(x) = sharpness(x)^alpha * UDCP_transmission(x)^beta，归一化到 [0, 1]
+        # 只把 L1 loss 乘上可信度权重图, 其他任何地方都不改 (densify / prune / SSIM 均不动)
+        # 默认 method="kmeans" (Lab K-means 颜色聚类 + 类内 LocVar mean, 从 mini v7 移植)
+        # method="legacy" 走老公式: W(x) = sharpness(x)^alpha * UDCP_transmission(x)^beta
         self.use_weight_map = False            # 是否启用
         self.weight_map_mode = "online"        # "online" | "precomputed"
-        self.weight_map_alpha = 1.0            # 清晰度指数
-        self.weight_map_beta = 1.0             # UDCP 传输率指数
+        self.weight_map_method = "kmeans"      # "kmeans" | "legacy"
+        self.weight_map_kmeans_k = 16          # K-means 类别数 (仅 method=kmeans)
+        self.weight_map_alpha = 1.0            # 清晰度指数 (仅 method=legacy)
+        self.weight_map_beta = 1.0             # UDCP 传输率指数 (仅 method=legacy)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

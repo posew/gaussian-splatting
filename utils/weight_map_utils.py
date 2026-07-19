@@ -79,32 +79,142 @@ def compute_transmission_weight(img_bgr: np.ndarray, patch_size: int = 15) -> np
     return transmission.astype(np.float32)
 
 
+def compute_local_color_var(img_bgr: np.ndarray, ksize: int = 15) -> np.ndarray:
+    """
+    Local Color Variance: 3 通道局部方差之和的开方, 5-95% 分位截断归一化。
+    高: 颜色/纹理跳变强 (物体边缘、细节)
+    低: 颜色平坦 (水体、铁皮平面)
+
+    (2026-07-19 从 mini-splatting fix-weightmap-norm @ 11415de 移植)
+    """
+    f = img_bgr.astype(np.float32) / 255.0
+    var_total = np.zeros(f.shape[:2], np.float32)
+    for c in range(3):
+        ch = f[:, :, c]
+        mean = cv2.blur(ch, (ksize, ksize))
+        mean_sq = cv2.blur(ch ** 2, (ksize, ksize))
+        var_total += np.maximum(mean_sq - mean ** 2, 0.0)
+    v = np.sqrt(var_total)
+    lo, hi = np.percentile(v, [5, 95])
+    return np.clip((v - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
+
+
+def compute_kmeans_weight_map(
+    img_bgr: np.ndarray,
+    ksize: int = 15,
+    k: int = 16,
+    kmeans_attempts: int = 3,
+    kmeans_max_iter: int = 10,
+) -> np.ndarray:
+    """
+    K-means 颜色聚类 + 类内 LocVar mean (mini-splatting v7 定稿, 2026-07-11)。
+
+    核心思想 (用户洞察):
+      - 铁皮的按钮 (LocVar 高) 和铁皮的平面 (LocVar 低) 颜色一致
+      - 水体和物体颜色差别大
+      → 按颜色分类, 每类 LocVar mean 就能同时标亮 "按钮 + 铁皮平面",
+         并让水体保持暗
+      → 相当于用颜色相似性做 "水下区域联通识别" (无空间约束的区域聚类)
+
+    步骤:
+      1. 计算 LocVar (compute_local_color_var)
+      2. 在 Lab 空间对像素做 K-means (K=16, 类别多则颜色区分更细)
+      3. 每个类内取 LocVar mean 作为该类分数
+      4. 类分数 min-max 归一化到 [0, 1]
+      5. 把类分数广播回像素得到 weight map
+
+    为什么不用 "类内 max": 每类都有可能包含少量高纹理 outlier, 用 max
+      会导致所有类都变 1.0 (mini v7 首次尝试实测塌陷)。mean 更稳。
+
+    Args:
+        img_bgr:         BGR 格式图像, uint8
+        ksize:           LocVar 局部窗口大小
+        k:               K-means 类别数 (16 更保守; 8 更激进)
+        kmeans_attempts: K-means 重启次数 (取最优)
+        kmeans_max_iter: K-means 最大迭代次数
+
+    Returns:
+        weight_map: float32, shape=(H, W), 值域 [0, 1]
+
+    (2026-07-19 从 mini-splatting fix-weightmap-norm @ 11415de 移植)
+    """
+    lv = compute_local_color_var(img_bgr, ksize)
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    H, W = lab.shape[:2]
+    pixels = lab.reshape(-1, 3)
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                kmeans_max_iter, 1.0)
+    _, labels, _ = cv2.kmeans(
+        pixels, k, None, criteria, kmeans_attempts, cv2.KMEANS_PP_CENTERS
+    )
+    labels = labels.flatten()
+    flat_lv = lv.flatten()
+
+    # 每类 mean = sum / cnt
+    class_sum = np.zeros(k, np.float64)
+    class_cnt = np.zeros(k, np.float64)
+    np.add.at(class_sum, labels, flat_lv)
+    np.add.at(class_cnt, labels, 1)
+    class_mean = (class_sum / np.maximum(class_cnt, 1)).astype(np.float32)
+
+    # 类均值 min-max 归一化到 [0,1]
+    cmin, cmax = class_mean.min(), class_mean.max()
+    if cmax - cmin > 1e-6:
+        class_mean = (class_mean - cmin) / (cmax - cmin)
+
+    weight = class_mean[labels].reshape(H, W)
+    return np.clip(weight, 0.0, 1.0).astype(np.float32)
+
+
 def compute_weight_map(
     img_bgr: np.ndarray,
     alpha: float = 1.0,
     beta: float = 1.0,
     patch_size: int = 15,
+    method: str = "kmeans",
+    kmeans_k: int = 16,
+    kmeans_ksize: int = 15,
 ) -> np.ndarray:
     """
-    融合权重图：W(x) = W_sharp(x)^alpha * t(x)^beta
+    权重图统一入口。
+
+    method="kmeans" (推荐, 从 mini-splatting v7 移植, 2026-07-19):
+      调用 compute_kmeans_weight_map: K-means 颜色聚类 + 类内 LocVar mean
+      - 铁皮按钮 (高纹理) → 高分类 → 类内平面被一起标亮
+      - 水体 (低纹理 & 独立颜色) → 低分类 → 保持暗
+      - LOW PSNR 图: med≈0.3, HIGH PSNR 图: med≈0.1 (符合语义)
+
+    method="legacy" (老公式, 仅供对比, 有两个 bug):
+      W(x) = W_sharp(x)^alpha * t(x)^beta
+      - bug1: sharpness /= max → 全图 med≈0.05
+      - bug2: transmission min-max → 全图 med≈1.0 (等于没起作用)
+      → 组合结果 med≈0.05
 
     Args:
-        img_bgr:    BGR 格式图像，uint8
-        alpha:      清晰度权重的指数
-        beta:       传输率权重的指数
-        patch_size: UDCP 的 patch 大小
+        img_bgr:      BGR 格式, uint8
+        method:       "kmeans" | "legacy"
+        kmeans_k:     K-means 类数 (仅 method=kmeans)
+        kmeans_ksize: LocVar 窗口 (仅 method=kmeans)
+        alpha/beta/patch_size: 仅 method=legacy 有效
 
     Returns:
-        weight_map: float32, shape=(H, W)，值域 [0, 1]
+        weight_map: float32, shape=(H, W), 值域 [0, 1]
     """
-    w_sharp = compute_sharpness_weight(img_bgr)
-    w_trans = compute_transmission_weight(img_bgr, patch_size=patch_size)
-    weight = (w_sharp ** alpha) * (w_trans ** beta)
-
-    w_max = weight.max()
-    if w_max > 1e-6:
-        weight = weight / w_max
-    return weight.astype(np.float32)
+    if method == "kmeans":
+        return compute_kmeans_weight_map(
+            img_bgr, ksize=kmeans_ksize, k=kmeans_k
+        )
+    elif method == "legacy":
+        w_sharp = compute_sharpness_weight(img_bgr)
+        w_trans = compute_transmission_weight(img_bgr, patch_size=patch_size)
+        weight = (w_sharp ** alpha) * (w_trans ** beta)
+        w_max = weight.max()
+        if w_max > 1e-6:
+            weight = weight / w_max
+        return weight.astype(np.float32)
+    else:
+        raise ValueError(f"unknown method: {method!r}, expected 'kmeans' or 'legacy'")
 
 
 # ─────────────────────────────────────────────
@@ -125,11 +235,15 @@ class WeightMapLoader:
         alpha: float = 1.0,
         beta: float = 1.0,
         weight_map_dir: str = "weight_maps",
+        method: str = "kmeans",
+        kmeans_k: int = 16,
     ):
         self.source_path = source_path
         self.mode = mode
         self.alpha = alpha
         self.beta = beta
+        self.method = method
+        self.kmeans_k = kmeans_k
         self.weight_map_dir = os.path.join(source_path, weight_map_dir)
         self._cache = {}
 
@@ -143,7 +257,10 @@ class WeightMapLoader:
             else:
                 print(f"[WeightMapLoader] Precomputed mode: {self.weight_map_dir}")
         else:
-            print(f"[WeightMapLoader] Online mode (alpha={alpha}, beta={beta})")
+            print(
+                f"[WeightMapLoader] Online mode "
+                f"(method={method}, kmeans_k={kmeans_k}, alpha={alpha}, beta={beta})"
+            )
 
     def get(self, viewpoint_cam, device: str = "cuda") -> torch.Tensor:
         """
@@ -199,4 +316,10 @@ class WeightMapLoader:
             img_np = (img_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-        return compute_weight_map(img_bgr, alpha=self.alpha, beta=self.beta)
+        return compute_weight_map(
+            img_bgr,
+            alpha=self.alpha,
+            beta=self.beta,
+            method=self.method,
+            kmeans_k=self.kmeans_k,
+        )
