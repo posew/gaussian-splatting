@@ -66,8 +66,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     # ------ weight-map loss (loss-only variant) ------
     # 只在 L1 loss 上乘一个可信度权重图, 其他任何地方都不改 (densify / prune / SSIM 均不动)
-    # method="kmeans" (默认, mini v7 移植): Lab K-means 颜色聚类 + 类内 LocVar mean
-    # method="legacy" (老公式): W(x) = 清晰度^alpha * UDCP 传输率^beta
+    # method="kmeans_x_legacy" (默认, 方案 C): kmeans×legacy 融合, 兼顾区域一致+水体抑制
+    # method="kmeans": 纯 K-means (07-11_11 版本, 抑制水体不足)
+    # method="legacy": 老公式 W(x) = 清晰度^alpha * UDCP 传输率^beta
     weight_map_loader = None
     if opt.use_weight_map:
         weight_map_loader = WeightMapLoader(
@@ -77,11 +78,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             beta=opt.weight_map_beta,
             method=opt.weight_map_method,
             kmeans_k=opt.weight_map_kmeans_k,
+            fusion_alpha=opt.weight_map_fusion_alpha,
         )
         print(
             f"[weightmap-loss-only] Enabled: mode={opt.weight_map_mode}, "
             f"method={opt.weight_map_method}, kmeans_k={opt.weight_map_kmeans_k}, "
-            f"alpha={opt.weight_map_alpha}, beta={opt.weight_map_beta}"
+            f"alpha={opt.weight_map_alpha}, beta={opt.weight_map_beta}, "
+            f"fusion_alpha={opt.weight_map_fusion_alpha}"
         )
 
     viewpoint_stack = scene.getTrainCameras().copy()

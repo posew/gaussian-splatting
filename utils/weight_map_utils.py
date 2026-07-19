@@ -175,28 +175,39 @@ def compute_weight_map(
     method: str = "kmeans",
     kmeans_k: int = 16,
     kmeans_ksize: int = 15,
+    fusion_alpha: float = 0.5,
 ) -> np.ndarray:
     """
     权重图统一入口。
 
-    method="kmeans" (推荐, 从 mini-splatting v7 移植, 2026-07-19):
+    method="kmeans" (从 mini-splatting v7 移植, 2026-07-19):
       调用 compute_kmeans_weight_map: K-means 颜色聚类 + 类内 LocVar mean
       - 铁皮按钮 (高纹理) → 高分类 → 类内平面被一起标亮
       - 水体 (低纹理 & 独立颜色) → 低分类 → 保持暗
-      - LOW PSNR 图: med≈0.3, HIGH PSNR 图: med≈0.1 (符合语义)
+      - 07-11_11 观察: 相对 legacy 抑制水体不足 (med=0.22 vs legacy 0.04)
+        → 水下漂浮物爆炸 (260K 高斯, +47%)
 
-    method="legacy" (老公式, 仅供对比, 有两个 bug):
+    method="legacy" (老公式, 有两个 bug 但对水体压制强):
       W(x) = W_sharp(x)^alpha * t(x)^beta
       - bug1: sharpness /= max → 全图 med≈0.05
       - bug2: transmission min-max → 全图 med≈1.0 (等于没起作用)
-      → 组合结果 med≈0.05
+      → 组合结果 med≈0.04, 87% 像素 < 0.1 (水体几乎被完全抑制)
+
+    method="kmeans_x_legacy" (方案 C · 2026-07-19 新增):
+      加权几何融合: W = W_kmeans^fusion_alpha * W_legacy^(1-fusion_alpha)
+      - kmeans 提供"区域一致性" (铁皮平面被识别为重点)
+      - legacy 提供"水体强抑制" (med 压回 0.05 量级)
+      - fusion_alpha=0.5 (默认): sqrt(kmeans * legacy), 对称
+      - fusion_alpha→1: 更靠近纯 kmeans
+      - fusion_alpha→0: 更靠近纯 legacy
 
     Args:
-        img_bgr:      BGR 格式, uint8
-        method:       "kmeans" | "legacy"
-        kmeans_k:     K-means 类数 (仅 method=kmeans)
-        kmeans_ksize: LocVar 窗口 (仅 method=kmeans)
-        alpha/beta/patch_size: 仅 method=legacy 有效
+        img_bgr:       BGR 格式, uint8
+        method:        "kmeans" | "legacy" | "kmeans_x_legacy"
+        kmeans_k:      K-means 类数 (仅 kmeans / kmeans_x_legacy)
+        kmeans_ksize:  LocVar 窗口 (仅 kmeans / kmeans_x_legacy)
+        fusion_alpha:  kmeans 侧权重 [0,1] (仅 kmeans_x_legacy)
+        alpha/beta/patch_size: legacy 侧参数
 
     Returns:
         weight_map: float32, shape=(H, W), 值域 [0, 1]
@@ -213,8 +224,28 @@ def compute_weight_map(
         if w_max > 1e-6:
             weight = weight / w_max
         return weight.astype(np.float32)
+    elif method == "kmeans_x_legacy":
+        w_km = compute_kmeans_weight_map(img_bgr, ksize=kmeans_ksize, k=kmeans_k)
+        w_sharp = compute_sharpness_weight(img_bgr)
+        w_trans = compute_transmission_weight(img_bgr, patch_size=patch_size)
+        w_leg = (w_sharp ** alpha) * (w_trans ** beta)
+        w_leg_max = w_leg.max()
+        if w_leg_max > 1e-6:
+            w_leg = w_leg / w_leg_max
+        fa = float(np.clip(fusion_alpha, 0.0, 1.0))
+        # 加权几何平均 (避免 0^0 用 eps)
+        eps = 1e-6
+        weight = (np.maximum(w_km, eps) ** fa) * (np.maximum(w_leg, eps) ** (1.0 - fa))
+        # 归一化到 [0,1]: 用 max 归一, 保持相对分布
+        w_max = weight.max()
+        if w_max > 1e-6:
+            weight = weight / w_max
+        return np.clip(weight, 0.0, 1.0).astype(np.float32)
     else:
-        raise ValueError(f"unknown method: {method!r}, expected 'kmeans' or 'legacy'")
+        raise ValueError(
+            f"unknown method: {method!r}, "
+            f"expected 'kmeans' | 'legacy' | 'kmeans_x_legacy'"
+        )
 
 
 # ─────────────────────────────────────────────
@@ -237,6 +268,7 @@ class WeightMapLoader:
         weight_map_dir: str = "weight_maps",
         method: str = "kmeans",
         kmeans_k: int = 16,
+        fusion_alpha: float = 0.5,
     ):
         self.source_path = source_path
         self.mode = mode
@@ -244,6 +276,7 @@ class WeightMapLoader:
         self.beta = beta
         self.method = method
         self.kmeans_k = kmeans_k
+        self.fusion_alpha = fusion_alpha
         self.weight_map_dir = os.path.join(source_path, weight_map_dir)
         self._cache = {}
 
@@ -259,7 +292,8 @@ class WeightMapLoader:
         else:
             print(
                 f"[WeightMapLoader] Online mode "
-                f"(method={method}, kmeans_k={kmeans_k}, alpha={alpha}, beta={beta})"
+                f"(method={method}, kmeans_k={kmeans_k}, "
+                f"alpha={alpha}, beta={beta}, fusion_alpha={fusion_alpha})"
             )
 
     def get(self, viewpoint_cam, device: str = "cuda") -> torch.Tensor:
@@ -322,4 +356,5 @@ class WeightMapLoader:
             beta=self.beta,
             method=self.method,
             kmeans_k=self.kmeans_k,
+            fusion_alpha=self.fusion_alpha,
         )

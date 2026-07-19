@@ -99,14 +99,17 @@ class OptimizationParams(ParamGroup):
         self.optimizer_type = "default"
         # -- weight-map loss (loss-only variant) --
         # 只把 L1 loss 乘上可信度权重图, 其他任何地方都不改 (densify / prune / SSIM 均不动)
-        # 默认 method="kmeans" (Lab K-means 颜色聚类 + 类内 LocVar mean, 从 mini v7 移植)
-        # method="legacy" 走老公式: W(x) = sharpness(x)^alpha * UDCP_transmission(x)^beta
+        # 默认 method="kmeans_x_legacy" (方案 C, 2026-07-19): kmeans 提供区域一致性,
+        #   legacy 提供水体强抑制, 加权几何融合 W = W_km^fa * W_leg^(1-fa)
+        # method="kmeans": 纯 K-means (07-11_11 版本, 抑制水体不足)
+        # method="legacy": 老公式 W(x) = sharpness(x)^alpha * UDCP_transmission(x)^beta
         self.use_weight_map = False            # 是否启用
         self.weight_map_mode = "online"        # "online" | "precomputed"
-        self.weight_map_method = "kmeans"      # "kmeans" | "legacy"
-        self.weight_map_kmeans_k = 16          # K-means 类别数 (仅 method=kmeans)
-        self.weight_map_alpha = 1.0            # 清晰度指数 (仅 method=legacy)
-        self.weight_map_beta = 1.0             # UDCP 传输率指数 (仅 method=legacy)
+        self.weight_map_method = "kmeans_x_legacy"  # "kmeans" | "legacy" | "kmeans_x_legacy"
+        self.weight_map_kmeans_k = 16          # K-means 类别数 (kmeans / kmeans_x_legacy)
+        self.weight_map_alpha = 1.0            # 清晰度指数 (legacy / kmeans_x_legacy)
+        self.weight_map_beta = 1.0             # UDCP 传输率指数 (legacy / kmeans_x_legacy)
+        self.weight_map_fusion_alpha = 0.5     # kmeans 侧权重 (仅 kmeans_x_legacy, [0,1])
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
