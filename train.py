@@ -86,6 +86,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             + (" (loss-only)" if opt.weight_densify_thr <= 0 else " (loss + hard densify gate)")
         )
 
+    if getattr(opt, "lambda_aniso", 0.0) > 0:
+        print(f"[aniso-reg] Enabled: lambda_aniso={opt.lambda_aniso}, max_ratio={opt.aniso_max_ratio}")
+
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
@@ -153,6 +156,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+        # -------- 各向异性正则 (07-19_04, 抑制狭长高斯) --------
+        # aniso_loss = mean(relu(max_scale / min_scale - MAX_RATIO))
+        # 让每个高斯的最大 scale / 最小 scale 的比例不超过 MAX_RATIO
+        # -> 训练过程中不允许出现极端狭长的高斯 -> 从源头无雾状针状
+        # lambda_aniso=0.0 (默认) 关闭正则, 保持完全向后兼容
+        Laniso = torch.tensor(0.0, device=image.device)
+        if getattr(opt, "lambda_aniso", 0.0) > 0:
+            scales = gaussians.get_scaling  # (N, 3) 已 exp 激活后的真实 scale
+            max_s = scales.max(dim=1).values
+            min_s = scales.min(dim=1).values
+            ratio = max_s / (min_s + 1e-8)
+            Laniso = torch.mean(torch.clamp(ratio - opt.aniso_max_ratio, min=0.0))
+            loss = loss + opt.lambda_aniso * Laniso
+        # -----------------------------------------------------
 
         # Depth regularization
         Ll1depth_pure = 0.0
