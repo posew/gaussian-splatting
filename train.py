@@ -64,9 +64,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    # ------ weight-map loss (loss-only variant) ------
-    # 只在 L1 loss 上乘一个可信度权重图，其他任何地方都不改（densify / prune / SSIM 均不动）
-    # 权重图 W(x) = 清晰度^alpha * UDCP 传输率^beta，归一化到 [0, 1]
+    # ------ weight-map guided training ------
+    # 两个作用点 (可独立开关):
+    #   1) L1 loss 加权 (软引导): Ll1 = (W * |img - gt|).mean()
+    #   2) Densify 硬门控 (硬抑制): 只有 W(投影像素) > weight_densify_thr 的高斯
+    #      才计入 add_densification_stats -> 从源头阻止低权重区 (水体) densify 繁殖
+    # 07-19_03 · 恢复 07-05 initial fbe0dfc 的初衷机制 (densify 硬门控)
+    # weight_densify_thr=0.0 (默认) 关闭门控, 等价于 loss-only 行为
     weight_map_loader = None
     if opt.use_weight_map:
         weight_map_loader = WeightMapLoader(
@@ -75,7 +79,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             alpha=opt.weight_map_alpha,
             beta=opt.weight_map_beta,
         )
-        print(f"[weightmap-loss-only] Enabled: mode={opt.weight_map_mode}, alpha={opt.weight_map_alpha}, beta={opt.weight_map_beta}")
+        print(
+            f"[weightmap] Enabled: mode={opt.weight_map_mode}, "
+            f"alpha={opt.weight_map_alpha}, beta={opt.weight_map_beta}, "
+            f"densify_thr={opt.weight_densify_thr}"
+            + (" (loss-only)" if opt.weight_densify_thr <= 0 else " (loss + hard densify gate)")
+        )
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -131,6 +140,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+        weight_map = None  # 保留到 densify 段用
         if weight_map_loader is not None:
             weight_map = weight_map_loader.get(viewpoint_cam, device=image.device)
             # 关键一行：仅在 L1 上加权，SSIM 完全不动
@@ -183,7 +193,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+                # -------- 权重图硬门控 (07-19_03, 从 fbe0dfc 移植) --------
+                # 只有可见 & 投影像素处权重 > thr 的高斯才计入 densify 统计
+                # 低权重区 (水体) 的高斯 -> 梯度不累积 -> 达不到 densify_grad_threshold -> 不分裂
+                # weight_densify_thr <= 0 时走原路 (loss-only 兼容)
+                if (opt.use_weight_map
+                        and weight_map is not None
+                        and opt.weight_densify_thr > 0):
+                    H, W = image.shape[1], image.shape[2]
+                    # visibility_filter 兼容: (N,) bool 或 (M,) long -> 统一转 long index
+                    if visibility_filter.dtype == torch.bool:
+                        vis_idx = visibility_filter.nonzero(as_tuple=True)[0]
+                    else:
+                        vis_idx = visibility_filter.squeeze(-1) if visibility_filter.dim() > 1 else visibility_filter
+                    # 3D 中心 -> NDC -> 像素
+                    xyz = gaussians.get_xyz[vis_idx]
+                    ones = torch.ones(xyz.shape[0], 1, device=xyz.device)
+                    xyz_h = torch.cat([xyz, ones], dim=1)
+                    proj = xyz_h @ viewpoint_cam.full_proj_transform
+                    ndc = proj[:, :2] / (proj[:, 3:4] + 1e-8)
+                    px = ((ndc[:, 0] + 1.0) * 0.5 * W).long().clamp(0, W - 1)
+                    py = ((ndc[:, 1] + 1.0) * 0.5 * H).long().clamp(0, H - 1)
+                    vis_weights = weight_map[0, py, px]
+                    high_conf_mask = vis_weights > opt.weight_densify_thr
+                    # 构造与全部高斯同长度的 bool mask, 只标记"可见 且 高权重"的
+                    N_all = gaussians.get_xyz.shape[0]
+                    high_conf_full = torch.zeros(N_all, dtype=torch.bool, device=xyz.device)
+                    if high_conf_mask.any():
+                        high_conf_full[vis_idx[high_conf_mask]] = True
+                    gaussians.add_densification_stats(viewspace_point_tensor, high_conf_full)
+                else:
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                # ----------------------------------------------------------
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None

@@ -97,13 +97,17 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
-        # -- weight-map loss (loss-only variant) --
-        # 只把 L1 loss 乘上可信度权重图，其他任何地方都不改（densify / prune / SSIM 均不动）
+        # -- weight-map guided training --
         # W(x) = sharpness(x)^alpha * UDCP_transmission(x)^beta，归一化到 [0, 1]
-        self.use_weight_map = False            # 是否启用
+        # 两个作用点独立开关:
+        #   1) L1 loss 加权 (软引导, 由 use_weight_map 控制)
+        #   2) Densify 硬门控 (硬抑制, 由 weight_densify_thr > 0 触发)
+        # 07-19_03 · 恢复 07-05 initial fbe0dfc 的 densify 硬门控 (weight_densify_thr=0.3)
+        self.use_weight_map = False            # 是否启用 (loss 加权 + 门控前置条件)
         self.weight_map_mode = "online"        # "online" | "precomputed"
         self.weight_map_alpha = 1.0            # 清晰度指数
         self.weight_map_beta = 1.0             # UDCP 传输率指数
+        self.weight_densify_thr = 0.0          # densify 硬门控阈值 (0=关闭=loss-only, 0.3=initial fbe0dfc 初衷值)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
