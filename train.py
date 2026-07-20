@@ -87,7 +87,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
 
     if getattr(opt, "lambda_aniso", 0.0) > 0:
-        print(f"[aniso-reg] Enabled: lambda_aniso={opt.lambda_aniso}, max_ratio={opt.aniso_max_ratio}")
+        print(f"[aniso-reg] Enabled: mode={getattr(opt,'aniso_mode','hard')}, "
+              f"lambda_aniso={opt.lambda_aniso}, max_ratio={opt.aniso_max_ratio}")
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -157,10 +158,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        # -------- 各向异性正则 (07-19_04, 抑制狭长高斯) --------
-        # aniso_loss = mean(relu(max_scale / min_scale - MAX_RATIO))
-        # 让每个高斯的最大 scale / 最小 scale 的比例不超过 MAX_RATIO
-        # -> 训练过程中不允许出现极端狭长的高斯 -> 从源头无雾状针状
+        # -------- 各向异性正则 (07-19_04 / 07-20 迭代, 抑制狭长高斯) --------
+        # 两种模式:
+        #   hard: aniso_loss = mean(relu(ratio - MAX_RATIO))
+        #         只惩罚 ratio > MAX_RATIO 的部分, 缺点是梯度只推到阈值就停
+        #         (07-19_04 l1r10 观察到针精准卡在 aniso=8-10 天花板下)
+        #   soft: aniso_loss = mean(relu(ratio - 1)) = mean(ratio - 1)
+        #         全程有梯度朝球形推 (ratio=1), 更彻底
         # lambda_aniso=0.0 (默认) 关闭正则, 保持完全向后兼容
         Laniso = torch.tensor(0.0, device=image.device)
         if getattr(opt, "lambda_aniso", 0.0) > 0:
@@ -168,9 +172,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             max_s = scales.max(dim=1).values
             min_s = scales.min(dim=1).values
             ratio = max_s / (min_s + 1e-8)
-            Laniso = torch.mean(torch.clamp(ratio - opt.aniso_max_ratio, min=0.0))
+            aniso_mode = getattr(opt, "aniso_mode", "hard")
+            if aniso_mode == "soft":
+                # ratio >= 1 恒成立, 直接 mean(ratio - 1); relu 保安全
+                Laniso = torch.mean(torch.clamp(ratio - 1.0, min=0.0))
+            else:  # hard
+                Laniso = torch.mean(torch.clamp(ratio - opt.aniso_max_ratio, min=0.0))
             loss = loss + opt.lambda_aniso * Laniso
-        # -----------------------------------------------------
+        # -----------------------------------------------------------------
 
         # Depth regularization
         Ll1depth_pure = 0.0

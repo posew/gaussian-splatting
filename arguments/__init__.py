@@ -109,12 +109,16 @@ class OptimizationParams(ParamGroup):
         self.weight_map_beta = 1.0             # UDCP 传输率指数
         self.weight_densify_thr = 0.0          # densify 硬门控阈值 (0=关闭=loss-only, 0.3=initial fbe0dfc 初衷值)
 
-        # -- 各向异性正则 (07-19_04, 抑制狭长高斯) --
-        # aniso_loss = mean(relu(max_scale/min_scale - aniso_max_ratio))
-        # 参考 Scaffold-GS / mini-splatting: MAX_RATIO=10, lambda=1.0~10.0
+        # -- 各向异性正则 (07-19_04 / 07-20 迭代, 抑制狭长高斯) --
+        # 两种模式:
+        #   hard: aniso_loss = mean(relu(ratio - aniso_max_ratio))
+        #         只惩罚 ratio > MAX_RATIO 的部分 (07-19_04 l1r10 观察到针精准卡阈值下)
+        #   soft: aniso_loss = mean(relu(ratio - 1))
+        #         全程有梯度朝球形推 (ratio=1), 更彻底
         # lambda_aniso=0.0 (默认) 关闭正则, 保持向后兼容
         self.lambda_aniso = 0.0
         self.aniso_max_ratio = 10.0
+        self.aniso_mode = "hard"    # "hard" | "soft"
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
