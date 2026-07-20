@@ -138,7 +138,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             prune_mask = visible_in_any & (max_w < thr)
             n_prune = int(prune_mask.sum())
             if n_prune > 0:
+                # gaussians.prune_points 依赖 self.tmp_radii, 该字段仅在
+                # densify_and_prune 内部临时赋值, 其余时段为 None. 我们在
+                # densify 段外调 prune_points 时需临时补一个占位 tmp_radii.
+                if gaussians.tmp_radii is None:
+                    gaussians.tmp_radii = torch.zeros(N, device=device)
+                    _restore_tmp_radii = True
+                else:
+                    _restore_tmp_radii = False
                 gaussians.prune_points(prune_mask)
+                if _restore_tmp_radii:
+                    gaussians.tmp_radii = None
             print(f"\n[hard-prune @ iter {iteration}] "
                   f"scanned {len(train_cams)} views, "
                   f"N_before={N}, visible_in_any={int(visible_in_any.sum())}, "
