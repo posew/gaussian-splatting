@@ -119,6 +119,17 @@ class OptimizationParams(ParamGroup):
         self.lambda_aniso = 0.0
         self.aniso_max_ratio = 10.0
         self.aniso_mode = "hard"    # "hard" | "soft"
+
+        # -- 07-20_02 · 物理删除非重点区高斯 (hard prune) --
+        # 每 wm_hard_prune_interval iter 扫一次:
+        #   遍历所有训练视角, 累积每个高斯投影像素的 weight 最大值
+        #   max_weight[i] < wm_hard_prune_thr => 该高斯在所有视角均落在非重点区 => 物理删除
+        # 与 densify hardgate 的区别:
+        #   densify hardgate = "低权重区不长新的" (软抑制, 只影响新分裂)
+        #   hard prune       = "已经在低权重区的老高斯, 物理删除" (硬删除)
+        # wm_hard_prune_thr=0.0 (默认) 关闭, 保持向后兼容
+        self.wm_hard_prune_thr = 0.0
+        self.wm_hard_prune_interval = 1000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

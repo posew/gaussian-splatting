@@ -90,6 +90,61 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(f"[aniso-reg] Enabled: mode={getattr(opt,'aniso_mode','hard')}, "
               f"lambda_aniso={opt.lambda_aniso}, max_ratio={opt.aniso_max_ratio}")
 
+    if getattr(opt, "wm_hard_prune_thr", 0.0) > 0:
+        print(f"[hard-prune] Enabled: thr={opt.wm_hard_prune_thr}, "
+              f"interval={opt.wm_hard_prune_interval}, "
+              f"整个训练全程启用, 多视角累积 max weight < thr 的高斯直接物理删除")
+
+    # -------- 07-20_02 · 物理删除非重点区高斯 (hard prune) 辅助函数 --------
+    def wm_hard_prune_step(gaussians, scene, weight_map_loader, thr, iteration):
+        """
+        遍历所有训练视角, 对每个高斯累积它在各视角投影像素处的 weight 最大值
+        max_weight[i] < thr => 该高斯在所有视角下都落在非重点区 => 物理删除
+        多视角累积可避免"遮挡视角误判" (某高斯被物体挡时投影像素恰是水体不代表它是水体)
+        """
+        with torch.no_grad():
+            N = gaussians.get_xyz.shape[0]
+            device = gaussians.get_xyz.device
+            max_w = torch.zeros(N, device=device)
+            visible_in_any = torch.zeros(N, dtype=torch.bool, device=device)
+
+            train_cams = scene.getTrainCameras()
+            xyz = gaussians.get_xyz
+            ones = torch.ones(N, 1, device=device)
+            xyz_h = torch.cat([xyz, ones], dim=1)  # (N, 4)
+
+            for cam in train_cams:
+                wm = weight_map_loader.get(cam, device=device)   # (1, H, W)
+                H, W = wm.shape[-2], wm.shape[-1]
+                proj = xyz_h @ cam.full_proj_transform            # (N, 4)
+                w_h = proj[:, 3]
+                in_front = w_h > 1e-6
+                ndc = proj[:, :2] / (w_h.unsqueeze(-1) + 1e-8)
+                in_ndc = (ndc[:, 0].abs() < 1) & (ndc[:, 1].abs() < 1)
+                on_screen = in_front & in_ndc
+                if not on_screen.any():
+                    continue
+                px = ((ndc[on_screen, 0] + 1.0) * 0.5 * W).long().clamp(0, W - 1)
+                py = ((ndc[on_screen, 1] + 1.0) * 0.5 * H).long().clamp(0, H - 1)
+                w_here = wm[0, py, px]
+                # 累积 max weight (只在 on_screen 的下标上)
+                idx = on_screen.nonzero(as_tuple=True)[0]
+                # torch scatter_reduce (max) 累积
+                max_w[idx] = torch.maximum(max_w[idx], w_here)
+                visible_in_any[idx] = True
+
+            # 只对"至少在一个视角可见"的高斯做判断
+            # (从未可见的高斯 = 不影响渲染, 也不清理, 交给原生 prune 逻辑)
+            prune_mask = visible_in_any & (max_w < thr)
+            n_prune = int(prune_mask.sum())
+            if n_prune > 0:
+                gaussians.prune_points(prune_mask)
+            print(f"\n[hard-prune @ iter {iteration}] "
+                  f"scanned {len(train_cams)} views, "
+                  f"N_before={N}, visible_in_any={int(visible_in_any.sum())}, "
+                  f"pruned={n_prune}, N_after={gaussians.get_xyz.shape[0]}")
+    # ------------------------------------------------------------------
+
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
@@ -260,6 +315,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            # -------- 07-20_02 · hard prune 触发点 (整个训练全程启用) --------
+            # 每 wm_hard_prune_interval iter 扫一次, 物理删除多视角均在非重点区的高斯
+            # 放在 densify 段之外, 因为要求整个 30k iter 均启用 (不只是 densify 期 15k)
+            if (opt.use_weight_map
+                    and weight_map_loader is not None
+                    and getattr(opt, "wm_hard_prune_thr", 0.0) > 0
+                    and iteration > 0
+                    and iteration % opt.wm_hard_prune_interval == 0
+                    and iteration < opt.iterations):  # 最后一步不要 prune, 避免破坏保存
+                wm_hard_prune_step(gaussians, scene, weight_map_loader,
+                                   opt.wm_hard_prune_thr, iteration)
+            # ---------------------------------------------------------------
 
             # Optimizer step
             if iteration < opt.iterations:
