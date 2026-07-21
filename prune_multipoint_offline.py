@@ -139,6 +139,12 @@ def main():
     dataset = model_g.extract(args)
     pipe = pipe_g.extract(args)
 
+    # sentinel=True 下未传的字段会是 None, 但 dataset_readers 判定 depths != ""
+    # 会导致误进 depth_params.json 加载路径; 修正为空字符串.
+    for k in ("images", "depths"):
+        if getattr(dataset, k, None) is None:
+            setattr(dataset, k, "" if k == "depths" else "images")
+
     if args.output_iter < 0:
         args.output_iter = args.iteration + 1
 
