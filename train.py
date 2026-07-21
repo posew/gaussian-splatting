@@ -91,51 +91,90 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
               f"lambda_aniso={opt.lambda_aniso}, max_ratio={opt.aniso_max_ratio}")
 
     if getattr(opt, "wm_hard_prune_thr", 0.0) > 0:
+        _grid = getattr(opt, "wm_hard_prune_grid", 5)
+        _rmul = getattr(opt, "wm_hard_prune_radius_mul", 2.0)
+        _oflw = getattr(opt, "wm_hard_prune_overflow_ratio", 0.7)
         print(f"[hard-prune] Enabled: thr={opt.wm_hard_prune_thr}, "
               f"interval={opt.wm_hard_prune_interval}, "
-              f"整个训练全程启用, 多视角累积 max weight < thr 的高斯直接物理删除")
+              f"grid={_grid}x{_grid}, radius_mul={_rmul}, overflow_ratio={_oflw}, "
+              f"多点椭圆采样判定, 所有视角外溢占比 > {_oflw} 才剔除")
 
     # -------- 07-20_02 · 物理删除非重点区高斯 (hard prune) 辅助函数 --------
-    def wm_hard_prune_step(gaussians, scene, weight_map_loader, thr, iteration):
+    # 2026-07-22 增强: 从单点判定改为投影椭圆多点采样 (5x5=25 点)
+    #   动机: 中心点在重点区、但椭球投影覆盖越出重点区的高斯 (骑墙/雾伞/横穿型)
+    #         用单点判定时会漏网, 导致水体上仍有大量雾状高斯
+    #   方案: 用 render 时的 radii (屏幕空间半径, 像素) 在椭圆包围盒内采样 25 点,
+    #         每个视角统计"投影范围内 wm<thr 的像素比例", 累积各视角最小的"外溢占比";
+    #         若最小外溢占比仍 > overflow_ratio => 说明所有视角都严重外溢 => 剔除
+    def wm_hard_prune_step(gaussians, scene, weight_map_loader, thr, iteration,
+                            grid_size=5, radius_mul=2.0, overflow_ratio=0.7,
+                            pipe=None, background=None):
         """
-        遍历所有训练视角, 对每个高斯累积它在各视角投影像素处的 weight 最大值
-        max_weight[i] < thr => 该高斯在所有视角下都落在非重点区 => 物理删除
-        多视角累积可避免"遮挡视角误判" (某高斯被物体挡时投影像素恰是水体不代表它是水体)
+        多点采样判定 (方案 A):
+          对每个高斯, 每个可见视角:
+            1) 用 render 拿到该视角下每个高斯的屏幕空间半径 (radii, 像素单位)
+            2) 在中心 ± radius_mul * radii 范围内做 grid_size x grid_size 均匀采样
+            3) 统计 25 个采样点中 wm < thr 的比例 = 该视角的"外溢占比"
+          聚合所有可见视角, 取"外溢占比最小的那个视角" (即最能证明这个高斯在重点区):
+            min_overflow_ratio[i] > overflow_ratio => 所有视角都严重外溢 => 物理删除
         """
         with torch.no_grad():
             N = gaussians.get_xyz.shape[0]
             device = gaussians.get_xyz.device
-            max_w = torch.zeros(N, device=device)
+            # 初始化为 1.0 (从未可见的默认最大外溢); 后面 visible_in_any 会保护它们不被误删
+            min_overflow = torch.ones(N, device=device)
             visible_in_any = torch.zeros(N, dtype=torch.bool, device=device)
 
             train_cams = scene.getTrainCameras()
             xyz = gaussians.get_xyz
-            ones = torch.ones(N, 1, device=device)
-            xyz_h = torch.cat([xyz, ones], dim=1)  # (N, 4)
+            ones_col = torch.ones(N, 1, device=device)
+            xyz_h = torch.cat([xyz, ones_col], dim=1)  # (N, 4)
+
+            # grid_size x grid_size 采样偏移 (单位: radii 倍数, 范围 [-radius_mul, +radius_mul])
+            offs = torch.linspace(-radius_mul, radius_mul, grid_size, device=device)
+            oy, ox = torch.meshgrid(offs, offs, indexing="ij")
+            ox_flat = ox.reshape(-1)  # (grid_size^2,)
+            oy_flat = oy.reshape(-1)
+            n_samples = ox_flat.shape[0]
 
             for cam in train_cams:
                 wm = weight_map_loader.get(cam, device=device)   # (1, H, W)
                 H, W = wm.shape[-2], wm.shape[-1]
-                proj = xyz_h @ cam.full_proj_transform            # (N, 4)
+
+                # 拿到每个高斯的屏幕半径 (需要 render 一次, 但用 no_grad)
+                render_pkg = render(cam, gaussians, pipe, background,
+                                     use_trained_exp=dataset.train_test_exp,
+                                     separate_sh=SPARSE_ADAM_AVAILABLE)
+                radii = render_pkg["radii"].float()  # (N,) 屏幕空间像素半径
+
+                proj = xyz_h @ cam.full_proj_transform  # (N, 4)
                 w_h = proj[:, 3]
                 in_front = w_h > 1e-6
                 ndc = proj[:, :2] / (w_h.unsqueeze(-1) + 1e-8)
                 in_ndc = (ndc[:, 0].abs() < 1) & (ndc[:, 1].abs() < 1)
-                on_screen = in_front & in_ndc
+                on_screen = in_front & in_ndc & (radii > 0)
                 if not on_screen.any():
                     continue
-                px = ((ndc[on_screen, 0] + 1.0) * 0.5 * W).long().clamp(0, W - 1)
-                py = ((ndc[on_screen, 1] + 1.0) * 0.5 * H).long().clamp(0, H - 1)
-                w_here = wm[0, py, px]
-                # 累积 max weight (只在 on_screen 的下标上)
+
                 idx = on_screen.nonzero(as_tuple=True)[0]
-                # torch scatter_reduce (max) 累积
-                max_w[idx] = torch.maximum(max_w[idx], w_here)
+                # 中心像素坐标
+                cx = (ndc[idx, 0] + 1.0) * 0.5 * W  # (M,)
+                cy = (ndc[idx, 1] + 1.0) * 0.5 * H
+                r = radii[idx].clamp(min=1.0)       # (M,) 至少 1 像素
+
+                # 广播采样: (M, 25)
+                sx = (cx.unsqueeze(1) + r.unsqueeze(1) * ox_flat.unsqueeze(0)).long().clamp(0, W - 1)
+                sy = (cy.unsqueeze(1) + r.unsqueeze(1) * oy_flat.unsqueeze(0)).long().clamp(0, H - 1)
+                w_samples = wm[0, sy, sx]           # (M, 25)
+
+                # 该视角每个高斯的"外溢占比" = 采样点中 wm<thr 的比例
+                overflow = (w_samples < thr).float().mean(dim=1)  # (M,)
+                # 聚合: 取所有可见视角的 min (最能证明"这个高斯其实落在重点区"的那个视角)
+                min_overflow[idx] = torch.minimum(min_overflow[idx], overflow)
                 visible_in_any[idx] = True
 
-            # 只对"至少在一个视角可见"的高斯做判断
-            # (从未可见的高斯 = 不影响渲染, 也不清理, 交给原生 prune 逻辑)
-            prune_mask = visible_in_any & (max_w < thr)
+            # 最终剔除条件: 至少在一个视角可见 & 所有可见视角外溢占比都>阈值 => 剔除
+            prune_mask = visible_in_any & (min_overflow > overflow_ratio)
             n_prune = int(prune_mask.sum())
             if n_prune > 0:
                 # gaussians.prune_points 依赖 self.tmp_radii, 该字段仅在
@@ -336,7 +375,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     and iteration % opt.wm_hard_prune_interval == 0
                     and iteration < opt.iterations):  # 最后一步不要 prune, 避免破坏保存
                 wm_hard_prune_step(gaussians, scene, weight_map_loader,
-                                   opt.wm_hard_prune_thr, iteration)
+                                   opt.wm_hard_prune_thr, iteration,
+                                   grid_size=getattr(opt, "wm_hard_prune_grid", 5),
+                                   radius_mul=getattr(opt, "wm_hard_prune_radius_mul", 2.0),
+                                   overflow_ratio=getattr(opt, "wm_hard_prune_overflow_ratio", 0.7),
+                                   pipe=pipe, background=background)
             # ---------------------------------------------------------------
 
             # Optimizer step

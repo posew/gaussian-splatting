@@ -130,6 +130,12 @@ class OptimizationParams(ParamGroup):
         # wm_hard_prune_thr=0.0 (默认) 关闭, 保持向后兼容
         self.wm_hard_prune_thr = 0.0
         self.wm_hard_prune_interval = 1000
+        # -- 2026-07-22 · 多点椭圆采样 (方案 A) 参数 --
+        # 单点判定漏网骑墙型/雾伞型/横穿型高斯 -> 用 render 时的 radii 在椭圆包围盒内
+        # 采样 grid x grid 点, 统计"外溢占比"; 只有所有视角外溢占比都>overflow_ratio 才剔除
+        self.wm_hard_prune_grid = 5            # 5x5=25 采样点
+        self.wm_hard_prune_radius_mul = 2.0    # 采样范围 = ±2 * radii (覆盖 ~2σ 椭圆)
+        self.wm_hard_prune_overflow_ratio = 0.7  # 外溢占比阈值 (>0.7 = 25 点中 18 点以上落在非重点区)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
