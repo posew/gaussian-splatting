@@ -201,8 +201,8 @@ def main():
 
     # 执行剪枝并保存
     if stats["N_prune"] > 0:
-        # gaussians.prune_points 依赖 tmp_radii
-        if gaussians.tmp_radii is None:
+        # gaussians.prune_points 依赖 tmp_radii; 加载模式下该属性未创建
+        if getattr(gaussians, "tmp_radii", None) is None:
             gaussians.tmp_radii = torch.zeros(stats["N_total"], device="cuda")
         gaussians.prune_points(prune_mask)
 
