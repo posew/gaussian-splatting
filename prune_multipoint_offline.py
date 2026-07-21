@@ -200,11 +200,20 @@ def main():
         return
 
     # 执行剪枝并保存
+    # 注意: 加载模式下 gaussians.optimizer 是 None, 不能走 gaussians.prune_points
+    # (它内部会调 _prune_optimizer 依赖 optimizer.param_groups)
+    # 因此直接对 6 个核心 tensor 做布尔筛选, 保留掩码取反 (True=保留)
     if stats["N_prune"] > 0:
-        # gaussians.prune_points 依赖 tmp_radii; 加载模式下该属性未创建
-        if getattr(gaussians, "tmp_radii", None) is None:
-            gaussians.tmp_radii = torch.zeros(stats["N_total"], device="cuda")
-        gaussians.prune_points(prune_mask)
+        keep = ~prune_mask
+        with torch.no_grad():
+            gaussians._xyz          = torch.nn.Parameter(gaussians._xyz[keep].requires_grad_(True))
+            gaussians._features_dc  = torch.nn.Parameter(gaussians._features_dc[keep].requires_grad_(True))
+            gaussians._features_rest = torch.nn.Parameter(gaussians._features_rest[keep].requires_grad_(True))
+            gaussians._scaling      = torch.nn.Parameter(gaussians._scaling[keep].requires_grad_(True))
+            gaussians._rotation     = torch.nn.Parameter(gaussians._rotation[keep].requires_grad_(True))
+            gaussians._opacity      = torch.nn.Parameter(gaussians._opacity[keep].requires_grad_(True))
+            if hasattr(gaussians, "max_radii2D") and gaussians.max_radii2D.numel() > 0:
+                gaussians.max_radii2D = gaussians.max_radii2D[keep]
 
     # 保存到新 iteration 目录
     out_dir = os.path.join(dataset.model_path, "point_cloud",
