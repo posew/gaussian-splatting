@@ -139,11 +139,15 @@ def main():
     dataset = model_g.extract(args)
     pipe = pipe_g.extract(args)
 
-    # sentinel=True 下未传的字段会是 None, 但 dataset_readers 判定 depths != ""
-    # 会导致误进 depth_params.json 加载路径; 修正为空字符串.
-    for k in ("images", "depths"):
+    # sentinel=True 下未传的字段会是 None, 需要用默认值补齐, 避免下游 None 报错
+    _defaults = {
+        "sh_degree": 3, "images": "images", "depths": "",
+        "resolution": -1, "white_background": False,
+        "train_test_exp": False, "data_device": "cuda", "eval": True,
+    }
+    for k, v in _defaults.items():
         if getattr(dataset, k, None) is None:
-            setattr(dataset, k, "" if k == "depths" else "images")
+            setattr(dataset, k, v)
 
     if args.output_iter < 0:
         args.output_iter = args.iteration + 1
