@@ -41,27 +41,63 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser
 
 
-def _load_wm(wm_dir: Path, name: str, target_hw: tuple):
+def _load_wm(wm_dir: Path, name: str, target_hw: tuple, alias_stem: str = None):
     """
     尝试从 wm_dir 加载与 `name` 同名的权重图.
     返回 (1, H, W) float tensor in cuda, 或 None.
     支持 .npy / .png / .jpg. 会 resize 到 target_hw.
+    若同名找不到, 用 alias_stem (由外部按 test 顺序映射到原图 stem, 例如
+    "00000" -> "0001") 再试一次.
     """
     if wm_dir is None or not wm_dir.is_dir():
         return None
-    stem = os.path.splitext(name)[0]
-    # 尝试 npy 精度更高
-    for ext in [".npy"]:
-        p = wm_dir / (stem + ext)
+    stems_try = [os.path.splitext(name)[0]]
+    if alias_stem is not None and alias_stem not in stems_try:
+        stems_try.append(alias_stem)
+    for stem in stems_try:
+        # npy 精度更高, 优先
+        p = wm_dir / (stem + ".npy")
         if p.exists():
             arr = np.load(str(p)).astype(np.float32)
             return _resize_wm_to_tensor(arr, target_hw)
-    for ext in [".png", ".jpg", ".jpeg"]:
-        p = wm_dir / (stem + ext)
-        if p.exists():
-            im = np.array(Image.open(p).convert("L"), dtype=np.float32) / 255.0
-            return _resize_wm_to_tensor(im, target_hw)
+        for ext in [".png", ".jpg", ".jpeg"]:
+            p = wm_dir / (stem + ext)
+            if p.exists():
+                im = np.array(Image.open(p).convert("L"), dtype=np.float32) / 255.0
+                return _resize_wm_to_tensor(im, target_hw)
     return None
+
+
+def _build_test_alias_map(scene_dir: str, n_test: int) -> list:
+    """
+    3DGS render 时 test 图按 enumerate(test_views) 顺序命名为 "00000.png" 等,
+    但预计算的 wm 用的是原图 stem (例如 "0001"). 这里重建映射:
+        输出 aliases[i] = 原图 stem, 对应 test 第 i 张.
+    规则: 读 cfg_args 拿 source_path -> sparse/0/images.bin -> sorted by name
+          -> llffhold=8 取 [0, 8, 16, ...] 张 -> stem 去后缀.
+    找不到时返回 [] (metrics.py 会走同名路径).
+    """
+    try:
+        import re
+        cfg = Path(scene_dir) / "cfg_args"
+        if not cfg.exists():
+            return []
+        m = re.search(r"source_path=['\"]([^'\"]+)['\"]", cfg.read_text())
+        if not m:
+            return []
+        src = m.group(1)
+        from scene.colmap_loader import read_extrinsics_binary
+        extrs = read_extrinsics_binary(os.path.join(src, "sparse", "0", "images.bin"))
+        names_sorted = sorted([e.name for e in extrs.values()])
+        # 与 dataset_readers.py 里 llffhold=8 保持一致
+        test_names = [n for i, n in enumerate(names_sorted) if i % 8 == 0]
+        if len(test_names) != n_test:
+            print(f"  [warn] alias map: sparse test={len(test_names)}, render test={n_test}, 用截取")
+        aliases = [os.path.splitext(n)[0] for n in test_names[:n_test]]
+        return aliases
+    except Exception as e:
+        print(f"  [warn] 无法建立 test alias map: {e}")
+        return []
 
 
 def _resize_wm_to_tensor(arr: np.ndarray, target_hw: tuple):
@@ -142,6 +178,12 @@ def evaluate(model_paths, wm_dir: str = None, wm_thr: float = 0.5):
                 renders_dir = method_dir / "renders"
                 renders, gts, image_names = readImages(renders_dir, gt_dir)
 
+                # 构造 test 图 stem 别名映射: 00000.png -> 0001 etc.
+                alias_map = _build_test_alias_map(scene_dir, len(image_names))
+                if alias_map:
+                    print(f"  test alias: {image_names[0]} -> {alias_map[0]}, ... "
+                          f"{image_names[-1]} -> {alias_map[-1]} ({len(alias_map)} 张)")
+
                 ssims = []
                 psnrs = []
                 lpipss = []
@@ -158,7 +200,9 @@ def evaluate(model_paths, wm_dir: str = None, wm_thr: float = 0.5):
                     # ── fg/bg 分离 (需要 wm) ──
                     if wm_dir_path is not None:
                         H, W = r.shape[-2], r.shape[-1]
-                        wm = _load_wm(wm_dir_path, image_names[idx], (H, W))
+                        alias = alias_map[idx] if idx < len(alias_map) else None
+                        wm = _load_wm(wm_dir_path, image_names[idx], (H, W),
+                                      alias_stem=alias)
                         if wm is not None:
                             cov = mask_coverage(wm, thr=wm_thr)
                             covs.append(cov)
