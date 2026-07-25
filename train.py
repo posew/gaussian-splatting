@@ -78,9 +78,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mode=opt.weight_map_mode,
             alpha=opt.weight_map_alpha,
             beta=opt.weight_map_beta,
+            method=getattr(opt, "weight_map_method", "legacy"),
+            sfm_kde_sigma_px=getattr(opt, "sfm_kde_sigma_px", 25.0),
+            sfm_kde_floor=getattr(opt, "sfm_kde_floor", 0.05),
+            locvar_dist_edge_thr=getattr(opt, "locvar_dist_edge_thr", 0.4),
+            locvar_dist_sigma_ratio=getattr(opt, "locvar_dist_sigma_ratio", 1.0/15),
+            locvar_dist_floor=getattr(opt, "locvar_dist_floor", 0.05),
         )
         print(
-            f"[weightmap] Enabled: mode={opt.weight_map_mode}, "
+            f"[weightmap] Enabled: method={getattr(opt,'weight_map_method','legacy')}, "
+            f"mode={opt.weight_map_mode}, "
             f"alpha={opt.weight_map_alpha}, beta={opt.weight_map_beta}, "
             f"densify_thr={opt.weight_densify_thr}"
             + (" (loss-only)" if opt.weight_densify_thr <= 0 else " (loss + hard densify gate)")

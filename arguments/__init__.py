@@ -108,6 +108,17 @@ class OptimizationParams(ParamGroup):
         self.weight_map_alpha = 1.0            # 清晰度指数
         self.weight_map_beta = 1.0             # UDCP 传输率指数
         self.weight_densify_thr = 0.0          # densify 硬门控阈值 (0=关闭=loss-only, 0.3=initial fbe0dfc 初衷值)
+        # -- SfM KDE 权重图 (feat-wm-sfm-kde, 2026-07-23) --
+        # method="sfm_kde":    用 COLMAP 三角化点做 2D 高斯 KDE, 天然 3D 一致, 免标注
+        # method="locvar_dist": LocVar 边缘 + distanceTransform 软填充, 主体填充路线,
+        #                       靠 "边缘影响半径" 覆盖低纹理表面 (铁柱/铁皮), 免 SfM/K-means
+        self.weight_map_method = "legacy"      # "legacy" | "sfm_kde" | "locvar_dist"
+        self.sfm_kde_sigma_px = 25.0           # 高斯核标准差 (像素, 训练分辨率下)
+        self.sfm_kde_floor = 0.05              # 归一后底噪 floor, 避免水体权重 0
+        # -- LocVar + 距离变换 (feat-wm-locvar-dist, 2026-07-25) --
+        self.locvar_dist_edge_thr = 0.4        # LocVar 边缘二值化阈值
+        self.locvar_dist_sigma_ratio = 1.0/15  # sigma = min(H,W) * ratio, 覆盖半径
+        self.locvar_dist_floor = 0.05          # 归一后底噪 floor
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
