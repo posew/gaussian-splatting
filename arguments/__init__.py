@@ -121,9 +121,9 @@ class OptimizationParams(ParamGroup):
         self.locvar_dist_floor = 0.05          # 归一后底噪 floor
         # -- wm_v2 (M1, 2026-07-25) --
         self.wm_v2_kmeans_k = 16               # LAB (a,b) K-means 簇数
-        self.wm_v2_caustic_L = 220             # 光斑亮度阈值 (LAB L 通道)
-        self.wm_v2_caustic_chroma = 15         # 光斑色度阈值 (|a-128|+|b-128|)
-        self.wm_v2_caustic_dilate = 7          # 光斑 mask 扩边像素
+        self.wm_v2_caustic_L = 200             # 光斑亮度阈值 (LAB L 通道), 水下场景 L_p99≈230
+        self.wm_v2_caustic_chroma = 40         # 光斑色度阈值 (|a-128|+|b-128|), 整体色度低故放宽
+        self.wm_v2_caustic_dilate = 9          # 光斑 mask 扩边像素
         self.wm_v2_colmap_seed_radius = 15     # COLMAP 每个种子画圆的半径
         self.wm_v2_use_colmap_seed = True      # 是否融合 COLMAP 种子
         super().__init__(parser, "Optimization Parameters")

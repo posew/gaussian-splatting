@@ -128,9 +128,9 @@ def main():
     ap.add_argument("--image_stems", type=str, default="",
                     help="指定要 dump 的图 stem, 逗号分隔 (例如 0001,0050,0100)")
     ap.add_argument("--kmeans_k", type=int, default=16)
-    ap.add_argument("--caustic_L", type=int, default=220)
-    ap.add_argument("--caustic_chroma", type=int, default=15)
-    ap.add_argument("--caustic_dilate", type=int, default=7)
+    ap.add_argument("--caustic_L", type=int, default=200)
+    ap.add_argument("--caustic_chroma", type=int, default=40)
+    ap.add_argument("--caustic_dilate", type=int, default=9)
     ap.add_argument("--seed_radius", type=int, default=15)
     ap.add_argument("--no_seed", action="store_true",
                     help="跳过 COLMAP seed 构建 (纯 kmeans_ab + caustic 对比)")

@@ -85,9 +85,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             locvar_dist_sigma_ratio=getattr(opt, "locvar_dist_sigma_ratio", 1.0/15),
             locvar_dist_floor=getattr(opt, "locvar_dist_floor", 0.05),
             wm_v2_kmeans_k=getattr(opt, "wm_v2_kmeans_k", 16),
-            wm_v2_caustic_L=getattr(opt, "wm_v2_caustic_L", 220),
-            wm_v2_caustic_chroma=getattr(opt, "wm_v2_caustic_chroma", 15),
-            wm_v2_caustic_dilate=getattr(opt, "wm_v2_caustic_dilate", 7),
+            wm_v2_caustic_L=getattr(opt, "wm_v2_caustic_L", 200),
+            wm_v2_caustic_chroma=getattr(opt, "wm_v2_caustic_chroma", 40),
+            wm_v2_caustic_dilate=getattr(opt, "wm_v2_caustic_dilate", 9),
             wm_v2_colmap_seed_radius=getattr(opt, "wm_v2_colmap_seed_radius", 15),
             wm_v2_use_colmap_seed=getattr(opt, "wm_v2_use_colmap_seed", True),
         )

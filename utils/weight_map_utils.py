@@ -399,9 +399,9 @@ def compute_kmeans_ab_weight_map(
 
 def compute_caustic_mask(
     img_bgr: np.ndarray,
-    thr_L: int = 220,
-    thr_chroma: int = 15,
-    dilate: int = 7,
+    thr_L: int = 200,
+    thr_chroma: int = 40,
+    dilate: int = 9,
 ) -> np.ndarray:
     """
     光斑掩膜: 高亮度 (LAB L 高) + 低色度 (|a-128|+|b-128| 小) -> 光斑.
@@ -444,9 +444,9 @@ def compute_wm_v2(
     colmap_seed_mask: np.ndarray = None,
     k: int = 16,
     ksize: int = 15,
-    caustic_thr_L: int = 220,
-    caustic_thr_chroma: int = 15,
-    caustic_dilate: int = 7,
+    caustic_thr_L: int = 200,
+    caustic_thr_chroma: int = 40,
+    caustic_dilate: int = 9,
 ) -> dict:
     """
     M1 wm_v2 一站式融合:
