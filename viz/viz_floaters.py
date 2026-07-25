@@ -340,17 +340,35 @@ def main():
         renders = test_dir / "renders"
         gts = test_dir / "gt"
         if renders.is_dir() and gts.is_dir():
-            fnames = sorted(os.listdir(renders))[: args.triptych_max]
+            all_fnames = sorted(os.listdir(renders))
+            fnames = all_fnames[: args.triptych_max]
+            # 建立 test idx -> 原图 stem 的 alias map (与 metrics.py 一致的 llffhold=8 规则)
+            alias_map = []
+            try:
+                import re
+                cfg = mp / "cfg_args"
+                m = re.search(r"source_path=['\"]([^'\"]+)['\"]", cfg.read_text())
+                if m:
+                    from scene.colmap_loader import read_extrinsics_binary
+                    extrs = read_extrinsics_binary(os.path.join(m.group(1), "sparse", "0", "images.bin"))
+                    names_sorted = sorted([e.name for e in extrs.values()])
+                    test_names = [n for i, n in enumerate(names_sorted) if i % 8 == 0]
+                    alias_map = [os.path.splitext(n)[0] for n in test_names[:len(all_fnames)]]
+            except Exception as e:
+                print(f"  [warn] triptych alias map fail: {e}")
             for fn in fnames:
                 stem = os.path.splitext(fn)[0]
-                # 尝试对应 wm (train view 与 test view 命名不同, 常见 test 用 idx 递增, 没直接对应 wm)
-                # 兜底: 若找不到 wm 就画 render + err, 不上 bg overlay
+                idx = all_fnames.index(fn)
                 r_img = Image.open(renders / fn)
                 W, H = r_img.size
                 wm = None
                 if wm_dir is not None:
-                    # 试若干可能的命名
-                    for cand in [stem, stem.lstrip("0"), stem.zfill(4)]:
+                    # 优先用 alias, 再回退到 stem 本身
+                    cands = []
+                    if idx < len(alias_map):
+                        cands.append(alias_map[idx])
+                    cands += [stem, stem.lstrip("0"), stem.zfill(4)]
+                    for cand in cands:
                         wm = load_wm(wm_dir, cand, (H, W))
                         if wm is not None:
                             break
