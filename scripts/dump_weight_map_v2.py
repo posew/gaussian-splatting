@@ -136,17 +136,23 @@ def main():
                     help="跳过 COLMAP seed 构建 (纯 kmeans_ab + caustic 对比)")
     ap.add_argument("--dump_caustic_alone", action="store_true",
                     help="额外输出一张 caustic mask 的独立 png")
+    ap.add_argument("--dump_all_wm", action="store_true",
+                    help="对所有图批量 dump wm_v2 到 <out_dir>/*.npy (给 metrics.py 用)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     all_paths = _list_images(args.source_path)
     stems = args.image_stems.split(",") if args.image_stems else None
-    samples = _pick_samples(all_paths, stems, args.n_samples)
-    if not samples:
-        print("[err] 没有采样到任何图, 退出.")
-        return
-    print(f"[dump_wm_v2] 采样 {len(samples)} 张: "
-          + ", ".join(os.path.basename(p) for p in samples))
+    if args.dump_all_wm:
+        samples = all_paths
+        print(f"[dump_wm_v2] dump_all_wm 模式: {len(samples)} 张全量")
+    else:
+        samples = _pick_samples(all_paths, stems, args.n_samples)
+        if not samples:
+            print("[err] 没有采样到任何图, 退出.")
+            return
+        print(f"[dump_wm_v2] 采样 {len(samples)} 张: "
+              + ", ".join(os.path.basename(p) for p in samples))
 
     # 构建 colmap seeds (若开启), 按第一张图的分辨率作为 target_hw
     seeds = {}
@@ -203,6 +209,16 @@ def main():
             caustic_dilate=args.caustic_dilate,
         )
         wm_final = v2["wm"]
+
+        # dump_all_wm 模式: 只存 npy, 跳过可视化
+        if args.dump_all_wm:
+            np.save(os.path.join(args.out_dir, f"{stem}.npy"),
+                    wm_final.astype(np.float32))
+            if (len(samples) < 20) or (samples.index(path) % 50 == 0):
+                print(f"  [{stem}] wm_mean={float(wm_final.mean()):.3f} "
+                      f"caustic_cov={float(caustic.mean()):.3%} "
+                      f"seed_cov={float(seed_mask.mean()) if seed_mask is not None else 0:.3%}")
+            continue
 
         # 构图
         pane_raw = _put_label(img, f"[{stem}] raw")
