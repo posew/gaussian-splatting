@@ -110,15 +110,22 @@ class OptimizationParams(ParamGroup):
         self.weight_densify_thr = 0.0          # densify 硬门控阈值 (0=关闭=loss-only, 0.3=initial fbe0dfc 初衷值)
         # -- SfM KDE 权重图 (feat-wm-sfm-kde, 2026-07-23) --
         # method="sfm_kde":    用 COLMAP 三角化点做 2D 高斯 KDE, 天然 3D 一致, 免标注
-        # method="locvar_dist": LocVar 边缘 + distanceTransform 软填充, 主体填充路线,
-        #                       靠 "边缘影响半径" 覆盖低纹理表面 (铁柱/铁皮), 免 SfM/K-means
-        self.weight_map_method = "legacy"      # "legacy" | "sfm_kde" | "locvar_dist"
+        # method="locvar_dist": LocVar 边缘 + distanceTransform 软填充, 主体填充路线
+        # method="wm_v2":      M1 (2026-07-25): kmeans_ab × (1-caustic) ∪ colmap_seed
+        self.weight_map_method = "legacy"      # "legacy" | "sfm_kde" | "locvar_dist" | "wm_v2"
         self.sfm_kde_sigma_px = 25.0           # 高斯核标准差 (像素, 训练分辨率下)
         self.sfm_kde_floor = 0.05              # 归一后底噪 floor, 避免水体权重 0
         # -- LocVar + 距离变换 (feat-wm-locvar-dist, 2026-07-25) --
         self.locvar_dist_edge_thr = 0.4        # LocVar 边缘二值化阈值
         self.locvar_dist_sigma_ratio = 1.0/15  # sigma = min(H,W) * ratio, 覆盖半径
         self.locvar_dist_floor = 0.05          # 归一后底噪 floor
+        # -- wm_v2 (M1, 2026-07-25) --
+        self.wm_v2_kmeans_k = 16               # LAB (a,b) K-means 簇数
+        self.wm_v2_caustic_L = 220             # 光斑亮度阈值 (LAB L 通道)
+        self.wm_v2_caustic_chroma = 15         # 光斑色度阈值 (|a-128|+|b-128|)
+        self.wm_v2_caustic_dilate = 7          # 光斑 mask 扩边像素
+        self.wm_v2_colmap_seed_radius = 15     # COLMAP 每个种子画圆的半径
+        self.wm_v2_use_colmap_seed = True      # 是否融合 COLMAP 种子
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

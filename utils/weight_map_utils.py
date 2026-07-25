@@ -308,6 +308,181 @@ def build_sfm_kde_maps_from_colmap(
 
 
 # ─────────────────────────────────────────────
+# M1.1 K-means (LAB a,b 通道) 权重图  (2026-07-25, feat-m0m1)
+#   动机: 光斑主要污染 L 通道, a/b 色度稳定;
+#         水体色相与物体色相在 (a, b) 平面上分得开.
+# ─────────────────────────────────────────────
+
+def compute_kmeans_ab_weight_map(
+    img_bgr: np.ndarray,
+    k: int = 16,
+    ksize: int = 15,
+    downsample: int = 4,
+    random_state: int = 0,
+) -> np.ndarray:
+    """
+    LAB a,b 色度 K-means 权重图.
+
+    步骤:
+      1. img -> LAB, 取 a, b 两个通道
+      2. downsample x{4} 后 kmeans (加速)
+      3. 每个 cluster 的分数 = 该 cluster 像素处的 LocVar 均值
+      4. label map 上色 -> 双线性回原始分辨率
+
+    直觉: 水体色相稳定 -> 属于同一 cluster -> LocVar 低 -> 分数低;
+          物体表面色相多样, LocVar 也高 -> 分数高.
+          光斑虽然亮但 a,b 色度是弱的, 会归到水体 cluster, 天然被压.
+
+    Returns:
+        float32 (H, W) in [0, 1]
+    """
+    try:
+        from sklearn.cluster import MiniBatchKMeans
+    except ImportError as e:
+        raise ImportError("compute_kmeans_ab_weight_map 需要 sklearn") from e
+
+    H, W = img_bgr.shape[:2]
+    img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)  # uint8 (H, W, 3)
+
+    # downsample for kmeans speed
+    if downsample > 1:
+        h2, w2 = H // downsample, W // downsample
+        lab_small = cv2.resize(img_lab, (w2, h2), interpolation=cv2.INTER_AREA)
+    else:
+        h2, w2 = H, W
+        lab_small = img_lab
+
+    ab = lab_small[..., 1:].reshape(-1, 2).astype(np.float32)  # (h2*w2, 2)
+    n_clusters = min(k, max(2, ab.shape[0] // 100))
+    km = MiniBatchKMeans(n_clusters=n_clusters, random_state=random_state,
+                         batch_size=4096, n_init=3, max_iter=50)
+    labels_small = km.fit_predict(ab).reshape(h2, w2)
+
+    # LocVar (在原分辨率上算, 用于打分)
+    lv = compute_local_color_var(img_bgr, ksize=ksize)  # (H, W) in [0, 1]
+
+    # 每个 cluster 的分数 = 该 cluster 在原图对应像素的 LocVar 平均
+    # 先把 labels_small 上采样到原分辨率 (最近邻, 保持 label 语义)
+    labels_full = cv2.resize(labels_small, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    scores = np.zeros(n_clusters, dtype=np.float32)
+    counts = np.zeros(n_clusters, dtype=np.int64)
+    for c in range(n_clusters):
+        m = labels_full == c
+        cnt = int(m.sum())
+        counts[c] = cnt
+        if cnt > 0:
+            scores[c] = float(lv[m].mean())
+
+    # 归一化 scores 到 [0, 1] (min-max, 只在有像素的 cluster 内)
+    valid = counts > 0
+    if valid.sum() > 1:
+        s_min, s_max = scores[valid].min(), scores[valid].max()
+        if s_max > s_min + 1e-6:
+            scores_n = (scores - s_min) / (s_max - s_min)
+            scores_n = np.clip(scores_n, 0.0, 1.0)
+        else:
+            scores_n = np.ones_like(scores) * 0.5
+    else:
+        scores_n = np.ones_like(scores) * 0.5
+
+    # 反查
+    wm = scores_n[labels_full]  # (H, W)
+    # 平滑一下, 避免 cluster 边界锯齿
+    wm = cv2.GaussianBlur(wm, (7, 7), 1.5)
+    return wm.astype(np.float32)
+
+
+# ─────────────────────────────────────────────
+# M1.2 光斑 (caustic) 检测掩膜  (2026-07-25)
+# ─────────────────────────────────────────────
+
+def compute_caustic_mask(
+    img_bgr: np.ndarray,
+    thr_L: int = 220,
+    thr_chroma: int = 15,
+    dilate: int = 7,
+) -> np.ndarray:
+    """
+    光斑掩膜: 高亮度 (LAB L 高) + 低色度 (|a-128|+|b-128| 小) -> 光斑.
+
+    步骤:
+      1. LAB 拆通道
+      2. bright = L > thr_L, chroma_low = (|a-128| + |b-128|) < thr_chroma
+      3. caustic = bright & chroma_low
+      4. 3x3 open 去孤立噪点
+      5. dilate x{dilate} 扩边, 覆盖光斑周围的过曝光晕
+
+    Returns:
+        float32 (H, W) in {0, 1}, 1 = 光斑区
+    """
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    L, a, b = lab[..., 0].astype(np.int16), lab[..., 1].astype(np.int16), lab[..., 2].astype(np.int16)
+    bright = L > thr_L
+    chroma = (np.abs(a - 128) + np.abs(b - 128))
+    chroma_low = chroma < thr_chroma
+    m = (bright & chroma_low).astype(np.uint8)
+
+    # morph open (去孤立点)
+    kernel3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel3)
+
+    # dilate 扩边
+    if dilate > 0:
+        kd = cv2.getStructuringElement(cv2.MORPH_RECT, (dilate, dilate))
+        m = cv2.dilate(m, kd)
+    return m.astype(np.float32)
+
+
+# ─────────────────────────────────────────────
+# M1.3 COLMAP 种子融合  (2026-07-25)
+#   注意: build_colmap_seed_masks 在 utils/colmap_seeds.py, 这里只提供 dict->mask 接口
+# ─────────────────────────────────────────────
+
+def compute_wm_v2(
+    img_bgr: np.ndarray,
+    colmap_seed_mask: np.ndarray = None,
+    k: int = 16,
+    ksize: int = 15,
+    caustic_thr_L: int = 220,
+    caustic_thr_chroma: int = 15,
+    caustic_dilate: int = 7,
+) -> dict:
+    """
+    M1 wm_v2 一站式融合:
+        wm_kmeans_ab = kmeans_ab(img)                          # M1.1
+        caustic      = caustic_mask(img)                       # M1.2
+        seed         = colmap_seed_mask (外部提供, M1.3)       # M1.3
+        wm_step1     = wm_kmeans_ab * (1 - caustic)
+        wm_final     = maximum(wm_step1, seed)                 # 种子无条件覆盖
+
+    返回 dict:
+        {'wm': (H,W), 'kmeans_ab': (H,W), 'caustic': (H,W), 'seed': (H,W) or None}
+    """
+    wm_km = compute_kmeans_ab_weight_map(img_bgr, k=k, ksize=ksize)
+    caustic = compute_caustic_mask(img_bgr, thr_L=caustic_thr_L,
+                                   thr_chroma=caustic_thr_chroma,
+                                   dilate=caustic_dilate)
+    wm = wm_km * (1.0 - caustic)
+    if colmap_seed_mask is not None:
+        seed = colmap_seed_mask.astype(np.float32)
+        if seed.shape != wm.shape:
+            seed = cv2.resize(seed, (wm.shape[1], wm.shape[0]),
+                              interpolation=cv2.INTER_LINEAR)
+        # 光斑区永远不给 seed 抬起 (物理不可信)
+        seed_effective = seed * (1.0 - caustic)
+        wm = np.maximum(wm, seed_effective)
+    else:
+        seed = None
+    return {
+        "wm": wm.astype(np.float32),
+        "kmeans_ab": wm_km.astype(np.float32),
+        "caustic": caustic.astype(np.float32),
+        "seed": seed if seed is not None else None,
+    }
+
+
+# ─────────────────────────────────────────────
 # 主接口：WeightMapLoader
 # ─────────────────────────────────────────────
 
@@ -331,6 +506,13 @@ class WeightMapLoader:
         locvar_dist_edge_thr: float = 0.4,
         locvar_dist_sigma_ratio: float = 1.0 / 15.0,
         locvar_dist_floor: float = 0.05,
+        # ── M1 wm_v2 参数 (2026-07-25) ──
+        wm_v2_kmeans_k: int = 16,
+        wm_v2_caustic_L: int = 220,
+        wm_v2_caustic_chroma: int = 15,
+        wm_v2_caustic_dilate: int = 7,
+        wm_v2_colmap_seed_radius: int = 15,
+        wm_v2_use_colmap_seed: bool = True,
     ):
         self.source_path = source_path
         self.mode = mode
@@ -342,9 +524,16 @@ class WeightMapLoader:
         self.locvar_dist_edge_thr = locvar_dist_edge_thr
         self.locvar_dist_sigma_ratio = locvar_dist_sigma_ratio
         self.locvar_dist_floor = locvar_dist_floor
+        self.wm_v2_kmeans_k = wm_v2_kmeans_k
+        self.wm_v2_caustic_L = wm_v2_caustic_L
+        self.wm_v2_caustic_chroma = wm_v2_caustic_chroma
+        self.wm_v2_caustic_dilate = wm_v2_caustic_dilate
+        self.wm_v2_colmap_seed_radius = wm_v2_colmap_seed_radius
+        self.wm_v2_use_colmap_seed = wm_v2_use_colmap_seed
         self.weight_map_dir = os.path.join(source_path, weight_map_dir)
         self._cache = {}
         self._sfm_kde_maps = None  # dict[stem] = (H, W) float32, 首次 get() 触发
+        self._colmap_seed_masks = None  # dict[stem] = (H, W) uint8, wm_v2 首次触发
 
         if method == "sfm_kde":
             print(f"[WeightMapLoader] method=sfm_kde (sigma_px={sfm_kde_sigma_px}, floor={sfm_kde_floor})")
@@ -357,6 +546,16 @@ class WeightMapLoader:
                 f"(edge_thr={locvar_dist_edge_thr}, sigma_ratio={locvar_dist_sigma_ratio}, "
                 f"floor={locvar_dist_floor}) - 主体填充路线, 距离变换软扩散, 免 SfM/K-means"
             )
+            return
+
+        if method == "wm_v2":
+            print(
+                f"[WeightMapLoader] method=wm_v2 (M1) "
+                f"(kmeans_k={wm_v2_kmeans_k}, caustic_L={wm_v2_caustic_L}, "
+                f"caustic_dilate={wm_v2_caustic_dilate}, "
+                f"colmap_seed={'ON' if wm_v2_use_colmap_seed else 'OFF'} radius={wm_v2_colmap_seed_radius})"
+            )
+            print(f"[WeightMapLoader]   首次 get() 触发 colmap 种子构建")
             return
 
         if mode == "precomputed":
@@ -389,6 +588,8 @@ class WeightMapLoader:
             weight = self._get_sfm_kde(viewpoint_cam)
         elif self.method == "locvar_dist":
             weight = self._compute_locvar_dist(viewpoint_cam)
+        elif self.method == "wm_v2":
+            weight = self._compute_wm_v2(viewpoint_cam)
         elif self.mode == "precomputed":
             weight = self._load_precomputed(img_name)
         else:
@@ -470,6 +671,48 @@ class WeightMapLoader:
             sigma_ratio=self.locvar_dist_sigma_ratio,
             floor=self.locvar_dist_floor,
         )
+
+    def _ensure_colmap_seeds(self, target_hw: tuple):
+        """
+        延迟构建 colmap 种子 mask (M1.3), 按训练分辨率.
+        target_hw: (H, W)
+        """
+        if self._colmap_seed_masks is not None:
+            return
+        if not self.wm_v2_use_colmap_seed:
+            self._colmap_seed_masks = {}
+            return
+        try:
+            from utils.colmap_seeds import build_colmap_seed_masks
+        except Exception as e:
+            print(f"[WeightMapLoader/wm_v2] ERROR import colmap_seeds: {e}")
+            self._colmap_seed_masks = {}
+            return
+        try:
+            self._colmap_seed_masks = build_colmap_seed_masks(
+                self.source_path,
+                target_hw=target_hw,
+                radius_px=self.wm_v2_colmap_seed_radius,
+            )
+            print(f"[WeightMapLoader/wm_v2] built {len(self._colmap_seed_masks)} colmap seeds at {target_hw}")
+        except Exception as e:
+            print(f"[WeightMapLoader/wm_v2] ERROR building colmap seeds: {e}")
+            self._colmap_seed_masks = {}
+
+    def _compute_wm_v2(self, viewpoint_cam):
+        img_bgr = self._read_bgr(viewpoint_cam)
+        H, W = img_bgr.shape[:2]
+        self._ensure_colmap_seeds((H, W))
+        seed = self._colmap_seed_masks.get(viewpoint_cam.image_name, None)
+        result = compute_wm_v2(
+            img_bgr,
+            colmap_seed_mask=seed,
+            k=self.wm_v2_kmeans_k,
+            caustic_thr_L=self.wm_v2_caustic_L,
+            caustic_thr_chroma=self.wm_v2_caustic_chroma,
+            caustic_dilate=self.wm_v2_caustic_dilate,
+        )
+        return result["wm"]
 
     def _read_bgr(self, viewpoint_cam):
         """从 cam 拿到 BGR uint8 图 (优先原图路径, fallback 到 tensor 反推)"""
