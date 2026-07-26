@@ -119,6 +119,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     wm_accum = None
     wm_accum_count = None
 
+    # -------- M4: 水下介质模型 (C1) --------
+    medium_model = None
+    medium_optimizer = None
+    if getattr(opt, "use_medium", False):
+        from utils.medium_model import MediumModel
+        medium_model = MediumModel(
+            beta_init=(opt.beta_init_r, opt.beta_init_g, opt.beta_init_b),
+        ).cuda()
+        medium_optimizer = torch.optim.Adam(medium_model.parameters(), lr=opt.medium_lr)
+        # B_inf 初始化延迟到第一帧拿到 mask 后 (init_B_from_bg_pixels)
+        medium_B_initialized = False
+        print(f"[M4] Medium model ON: β_init=({opt.beta_init_r},{opt.beta_init_g},{opt.beta_init_b}), "
+              f"warmup={opt.medium_warmup_iter}, β_free={opt.medium_beta_free_iter}, "
+              f"w_mono={opt.w_mono}, lr={opt.medium_lr}")
+    # ----------------------------------------
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
@@ -181,8 +197,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if caustic is not None:
                 hard_mask = hard_mask * (1.0 - caustic)  # 光斑区置 0
 
-            # M3.4: 显式背景色 compositing
-            if opt.use_explicit_bg:
+            # ---- M4: 介质模型 compositing (替代 M3.4 显式背景) ----
+            if medium_model is not None and iteration > opt.medium_warmup_iter:
+                # B_inf 首帧初始化
+                if not medium_B_initialized:
+                    medium_model.init_B_from_bg_pixels(gt_image, hard_mask)
+                    medium_B_initialized = True
+                    print(f"[M4] B_inf initialized to {medium_model.B_inf.data.tolist()}")
+
+                # 冻结 β (warmup < iter < beta_free) 或全部可学
+                beta_frozen = iteration < opt.medium_beta_free_iter
+                if beta_frozen:
+                    medium_model.beta_raw.requires_grad_(False)
+                else:
+                    medium_model.beta_raw.requires_grad_(True)
+
+                depth_map = render_pkg["depth"]  # (1, H, W)
+                J = image  # 高斯渲染的 radiance
+                I_fg = medium_model(J, depth_map)
+                B_medium = medium_model.B_inf.view(3, 1, 1)
+                image = hard_mask * I_fg + (1.0 - hard_mask) * B_medium
+
+            # M3.4: 显式背景色 compositing (M4 关闭时 fallback)
+            elif opt.use_explicit_bg:
                 bg_mask_bool = (hard_mask < 0.5)  # (1, H, W) bool
                 bg_medians = []
                 for c in range(3):
@@ -237,7 +274,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
+        # M4: 通道单调约束 (仅 β 可学阶段)
+        if (medium_model is not None
+                and iteration > opt.medium_beta_free_iter):
+            L_mono = medium_model.mono_loss()
+            loss = loss + opt.w_mono * L_mono
+        else:
+            L_mono = None
+
         loss.backward()
+
+        # M4: medium optimizer step (独立于高斯 optimizer)
+        if medium_model is not None and iteration > opt.medium_warmup_iter:
+            medium_optimizer.step()
+            medium_optimizer.zero_grad(set_to_none=True)
+            if tb_writer:
+                tb_writer.add_scalar('medium/beta_R', medium_model.beta[0].item(), iteration)
+                tb_writer.add_scalar('medium/beta_G', medium_model.beta[1].item(), iteration)
+                tb_writer.add_scalar('medium/beta_B', medium_model.beta[2].item(), iteration)
+                tb_writer.add_scalar('medium/B_inf_R', medium_model.B_inf[0].item(), iteration)
+                tb_writer.add_scalar('medium/B_inf_G', medium_model.B_inf[1].item(), iteration)
+                tb_writer.add_scalar('medium/B_inf_B', medium_model.B_inf[2].item(), iteration)
+                if L_mono is not None:
+                    tb_writer.add_scalar('medium/L_mono', L_mono.item(), iteration)
+            if iteration % 5000 == 0:
+                b = medium_model.beta.data.tolist()
+                bi = medium_model.B_inf.data.tolist()
+                mono_str = f", L_mono={L_mono.item():.4f}" if L_mono is not None else ""
+                print(f"[M4] iter {iteration}: β=({b[0]:.3f},{b[1]:.3f},{b[2]:.3f}), "
+                      f"B∞=({bi[0]:.3f},{bi[1]:.3f},{bi[2]:.3f}){mono_str}")
 
         iter_end.record()
 
