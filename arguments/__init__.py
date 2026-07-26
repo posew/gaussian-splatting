@@ -126,6 +126,12 @@ class OptimizationParams(ParamGroup):
         self.wm_v2_caustic_dilate = 9          # 光斑 mask 扩边像素
         self.wm_v2_colmap_seed_radius = 15     # COLMAP 每个种子画圆的半径
         self.wm_v2_use_colmap_seed = True      # 是否融合 COLMAP 种子
+        # -- M3: 三层门控 + 显式背景色 (feat-tri-gate-bg, 2026-07-26) --
+        self.wm_hard_thr = 0.3                 # hard mask 二值化阈值
+        self.wm_erode_px = 6                   # mask 边界腐蚀像素 (SSIM 窗口一半)
+        self.wm_prune_interval = 500           # prune 门控触发间隔 (iter)
+        self.wm_prune_decay = 0.5              # bg 高斯 opacity 半衰系数
+        self.use_explicit_bg = False            # 启用 per-view 显式背景色
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

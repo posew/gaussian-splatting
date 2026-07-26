@@ -532,6 +532,7 @@ class WeightMapLoader:
         self.wm_v2_use_colmap_seed = wm_v2_use_colmap_seed
         self.weight_map_dir = os.path.join(source_path, weight_map_dir)
         self._cache = {}
+        self._caustic_cache = {}
         self._sfm_kde_maps = None  # dict[stem] = (H, W) float32, 首次 get() 触发
         self._colmap_seed_masks = None  # dict[stem] = (H, W) uint8, wm_v2 首次触发
 
@@ -712,7 +713,18 @@ class WeightMapLoader:
             caustic_thr_chroma=self.wm_v2_caustic_chroma,
             caustic_dilate=self.wm_v2_caustic_dilate,
         )
+        self._caustic_cache[viewpoint_cam.image_name] = torch.from_numpy(
+            result["caustic"]).unsqueeze(0)  # (1, H, W)
         return result["wm"]
+
+    def get_caustic_mask(self, viewpoint_cam, device="cuda"):
+        name = viewpoint_cam.image_name
+        if name in self._caustic_cache:
+            return self._caustic_cache[name].to(device)
+        self.get(viewpoint_cam, device=device)
+        if name in self._caustic_cache:
+            return self._caustic_cache[name].to(device)
+        return None
 
     def _read_bgr(self, viewpoint_cam):
         """从 cam 拿到 BGR uint8 图 (优先原图路径, fallback 到 tensor 反推)"""

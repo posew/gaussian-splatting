@@ -11,12 +11,13 @@
 
 import os
 import torch
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state, get_expon_lr_func
+from utils.general_utils import safe_state, get_expon_lr_func, inverse_sigmoid
 from utils.weight_map_utils import WeightMapLoader
 import uuid
 from tqdm import tqdm
@@ -104,6 +105,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+    # M3: 预构建腐蚀核 (用于 SSIM mask 边界腐蚀)
+    use_hard_mask = (weight_map_loader is not None and opt.wm_hard_thr > 0
+                     and getattr(opt, "weight_map_method", "legacy") == "wm_v2")
+    if use_hard_mask:
+        erode_k = max(3, opt.wm_erode_px * 2 + 1)
+        erode_kernel = torch.ones(1, 1, erode_k, erode_k, device="cuda")
+        print(f"[M3] Hard mask ON: thr={opt.wm_hard_thr}, erode={opt.wm_erode_px}px, "
+              f"explicit_bg={opt.use_explicit_bg}, "
+              f"prune_interval={opt.wm_prune_interval}, prune_decay={opt.wm_prune_decay}")
+
+    # M3.3: prune gating 累积器 (多视角 wm 平均)
+    wm_accum = None
+    wm_accum_count = None
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
@@ -154,16 +169,54 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         weight_map = None  # 保留到 densify 段用
+        hard_mask = None   # M3: 二值前景 mask
+
         if weight_map_loader is not None:
             weight_map = weight_map_loader.get(viewpoint_cam, device=image.device)
-            # 关键一行：仅在 L1 上加权，SSIM 完全不动
-            Ll1 = (weight_map * torch.abs(image - gt_image)).mean()
+
+        if use_hard_mask and weight_map is not None:
+            # ---- M3.1: hard mask + caustic + erode ----
+            caustic = weight_map_loader.get_caustic_mask(viewpoint_cam, device=image.device)
+            hard_mask = (weight_map > opt.wm_hard_thr).float()
+            if caustic is not None:
+                hard_mask = hard_mask * (1.0 - caustic)  # 光斑区置 0
+
+            # M3.4: 显式背景色 compositing
+            if opt.use_explicit_bg:
+                bg_mask_bool = (hard_mask < 0.5)  # (1, H, W) bool
+                bg_medians = []
+                for c in range(3):
+                    ch_bg = gt_image[c][bg_mask_bool[0]]
+                    if ch_bg.numel() > 0:
+                        bg_medians.append(ch_bg.median())
+                    else:
+                        bg_medians.append(torch.tensor(0.0, device=image.device))
+                B_view = torch.stack(bg_medians).view(3, 1, 1)  # (3, 1, 1)
+                image = hard_mask * image + (1.0 - hard_mask) * B_view
+
+            # L1: masked mean
+            Ll1 = (hard_mask * torch.abs(image - gt_image)).sum() / (hard_mask.sum() * 3 + 1e-6)
+
+            # SSIM: eroded mask (避免边界伪影)
+            mask_4d = hard_mask.unsqueeze(0)  # (1, 1, H, W)
+            mask_erode = F.conv2d(mask_4d, erode_kernel, padding=erode_k // 2)
+            mask_erode = (mask_erode >= erode_kernel.numel()).float().squeeze(0)  # (1, H, W)
+            image_masked = image * mask_erode
+            gt_masked = gt_image * mask_erode
+            if FUSED_SSIM_AVAILABLE:
+                ssim_value = fused_ssim(image_masked.unsqueeze(0), gt_masked.unsqueeze(0))
+            else:
+                ssim_value = ssim(image_masked, gt_masked)
         else:
-            Ll1 = l1_loss(image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        else:
-            ssim_value = ssim(image, gt_image)
+            # 原始路径: soft weight map or no weight map
+            if weight_map is not None:
+                Ll1 = (weight_map * torch.abs(image - gt_image)).mean()
+            else:
+                Ll1 = l1_loss(image, gt_image)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            else:
+                ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
@@ -174,8 +227,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
 
+            if hard_mask is not None:
+                depth_mask = depth_mask * hard_mask  # M3: 前景区域才算 depth loss
+
             Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
+            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure
             loss += Ll1depth
             Ll1depth = Ll1depth.item()
         else:
@@ -243,9 +299,53 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            # -------- M3.3: Prune 门控 (bg 高斯 opacity 半衰) --------
+            if (use_hard_mask
+                    and opt.wm_prune_interval > 0
+                    and weight_map is not None):
+                N_all = gaussians.get_xyz.shape[0]
+                # 初始化累积器
+                if wm_accum is None or wm_accum.shape[0] != N_all:
+                    wm_accum = torch.zeros(N_all, device="cuda")
+                    wm_accum_count = torch.zeros(N_all, device="cuda")
+                # 当前视角可见高斯的 wm 值累积
+                if visibility_filter.dtype == torch.bool:
+                    vis_idx = visibility_filter.nonzero(as_tuple=True)[0]
+                else:
+                    vis_idx = visibility_filter.squeeze(-1) if visibility_filter.dim() > 1 else visibility_filter
+                H_img, W_img = image.shape[1], image.shape[2]
+                xyz_vis = gaussians.get_xyz[vis_idx]
+                ones_vis = torch.ones(xyz_vis.shape[0], 1, device=xyz_vis.device)
+                xyz_h = torch.cat([xyz_vis, ones_vis], dim=1)
+                proj = xyz_h @ viewpoint_cam.full_proj_transform
+                ndc = proj[:, :2] / (proj[:, 3:4] + 1e-8)
+                px = ((ndc[:, 0] + 1.0) * 0.5 * W_img).long().clamp(0, W_img - 1)
+                py = ((ndc[:, 1] + 1.0) * 0.5 * H_img).long().clamp(0, H_img - 1)
+                vis_wm = weight_map[0, py, px]
+                wm_accum[vis_idx] += vis_wm
+                wm_accum_count[vis_idx] += 1.0
+
+                if iteration % opt.wm_prune_interval == 0 and iteration > 0:
+                    observed = wm_accum_count > 0
+                    avg_wm = torch.zeros(N_all, device="cuda")
+                    avg_wm[observed] = wm_accum[observed] / wm_accum_count[observed]
+                    bg_gaussians = observed & (avg_wm < opt.wm_hard_thr)
+                    if bg_gaussians.any():
+                        cur_opacity = gaussians.get_opacity.squeeze(-1)
+                        decayed = cur_opacity.clone()
+                        decayed[bg_gaussians] *= opt.wm_prune_decay
+                        new_opacity_logit = inverse_sigmoid(decayed.clamp(1e-6, 1 - 1e-6))
+                        gaussians._opacity.data[:, 0] = new_opacity_logit
+                        n_bg = int(bg_gaussians.sum().item())
+                        if iteration % 2000 == 0:
+                            print(f"[M3.3 prune] iter {iteration}: {n_bg}/{N_all} bg gaussians decayed (×{opt.wm_prune_decay})")
+                    wm_accum.zero_()
+                    wm_accum_count.zero_()
+            # -------------------------------------------------------
 
             # Optimizer step
             if iteration < opt.iterations:
