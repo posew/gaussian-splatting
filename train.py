@@ -323,6 +323,50 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
+            # -------- M3.3: Prune 门控 (bg 高斯 opacity 半衰) --------
+            # MUST run before densification — densify_and_prune changes gaussian
+            # indices, making the current visibility_filter stale.
+            if (use_hard_mask
+                    and opt.wm_prune_interval > 0
+                    and weight_map is not None):
+                N_all = gaussians.get_xyz.shape[0]
+                if wm_accum is None or wm_accum.shape[0] != N_all:
+                    wm_accum = torch.zeros(N_all, device="cuda")
+                    wm_accum_count = torch.zeros(N_all, device="cuda")
+                if visibility_filter.dtype == torch.bool:
+                    vis_idx = visibility_filter.nonzero(as_tuple=True)[0]
+                else:
+                    vis_idx = visibility_filter.squeeze(-1) if visibility_filter.dim() > 1 else visibility_filter
+                H_img, W_img = image.shape[1], image.shape[2]
+                xyz_vis = gaussians.get_xyz[vis_idx]
+                ones_vis = torch.ones(xyz_vis.shape[0], 1, device=xyz_vis.device)
+                xyz_h = torch.cat([xyz_vis, ones_vis], dim=1)
+                proj = xyz_h @ viewpoint_cam.full_proj_transform
+                ndc = proj[:, :2] / (proj[:, 3:4] + 1e-8)
+                px = ((ndc[:, 0] + 1.0) * 0.5 * W_img).long().clamp(0, W_img - 1)
+                py = ((ndc[:, 1] + 1.0) * 0.5 * H_img).long().clamp(0, H_img - 1)
+                vis_wm = weight_map[0, py, px]
+                wm_accum[vis_idx] += vis_wm
+                wm_accum_count[vis_idx] += 1.0
+
+                if iteration % opt.wm_prune_interval == 0 and iteration > opt.densify_from_iter:
+                    observed = wm_accum_count > 0
+                    avg_wm = torch.zeros(N_all, device="cuda")
+                    avg_wm[observed] = wm_accum[observed] / wm_accum_count[observed]
+                    bg_gaussians = observed & (avg_wm < opt.wm_hard_thr)
+                    if bg_gaussians.any():
+                        cur_opacity = gaussians.get_opacity.squeeze(-1)
+                        decayed = cur_opacity.clone()
+                        decayed[bg_gaussians] *= opt.wm_prune_decay
+                        new_opacity_logit = inverse_sigmoid(decayed.clamp(1e-4, 1 - 1e-4))
+                        gaussians._opacity.data[:, 0] = new_opacity_logit
+                        n_bg = int(bg_gaussians.sum().item())
+                        if iteration % 2000 == 0:
+                            print(f"[M3.3 prune] iter {iteration}: {n_bg}/{N_all} bg gaussians decayed (×{opt.wm_prune_decay})")
+                    wm_accum.zero_()
+                    wm_accum_count.zero_()
+            # -------------------------------------------------------
+
             # Densification
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
@@ -367,50 +411,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
-
-            # -------- M3.3: Prune 门控 (bg 高斯 opacity 半衰) --------
-            if (use_hard_mask
-                    and opt.wm_prune_interval > 0
-                    and weight_map is not None):
-                N_all = gaussians.get_xyz.shape[0]
-                # 初始化累积器
-                if wm_accum is None or wm_accum.shape[0] != N_all:
-                    wm_accum = torch.zeros(N_all, device="cuda")
-                    wm_accum_count = torch.zeros(N_all, device="cuda")
-                # 当前视角可见高斯的 wm 值累积
-                if visibility_filter.dtype == torch.bool:
-                    vis_idx = visibility_filter.nonzero(as_tuple=True)[0]
-                else:
-                    vis_idx = visibility_filter.squeeze(-1) if visibility_filter.dim() > 1 else visibility_filter
-                H_img, W_img = image.shape[1], image.shape[2]
-                xyz_vis = gaussians.get_xyz[vis_idx]
-                ones_vis = torch.ones(xyz_vis.shape[0], 1, device=xyz_vis.device)
-                xyz_h = torch.cat([xyz_vis, ones_vis], dim=1)
-                proj = xyz_h @ viewpoint_cam.full_proj_transform
-                ndc = proj[:, :2] / (proj[:, 3:4] + 1e-8)
-                px = ((ndc[:, 0] + 1.0) * 0.5 * W_img).long().clamp(0, W_img - 1)
-                py = ((ndc[:, 1] + 1.0) * 0.5 * H_img).long().clamp(0, H_img - 1)
-                vis_wm = weight_map[0, py, px]
-                wm_accum[vis_idx] += vis_wm
-                wm_accum_count[vis_idx] += 1.0
-
-                if iteration % opt.wm_prune_interval == 0 and iteration > opt.densify_from_iter:
-                    observed = wm_accum_count > 0
-                    avg_wm = torch.zeros(N_all, device="cuda")
-                    avg_wm[observed] = wm_accum[observed] / wm_accum_count[observed]
-                    bg_gaussians = observed & (avg_wm < opt.wm_hard_thr)
-                    if bg_gaussians.any():
-                        cur_opacity = gaussians.get_opacity.squeeze(-1)
-                        decayed = cur_opacity.clone()
-                        decayed[bg_gaussians] *= opt.wm_prune_decay
-                        new_opacity_logit = inverse_sigmoid(decayed.clamp(1e-4, 1 - 1e-4))
-                        gaussians._opacity.data[:, 0] = new_opacity_logit
-                        n_bg = int(bg_gaussians.sum().item())
-                        if iteration % 2000 == 0:
-                            print(f"[M3.3 prune] iter {iteration}: {n_bg}/{N_all} bg gaussians decayed (×{opt.wm_prune_decay})")
-                    wm_accum.zero_()
-                    wm_accum_count.zero_()
-            # -------------------------------------------------------
 
             # Optimizer step
             if iteration < opt.iterations:
