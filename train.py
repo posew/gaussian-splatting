@@ -394,7 +394,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 wm_accum[vis_idx] += vis_wm
                 wm_accum_count[vis_idx] += 1.0
 
-                if iteration % opt.wm_prune_interval == 0 and iteration > 0:
+                if iteration % opt.wm_prune_interval == 0 and iteration > opt.densify_from_iter:
                     observed = wm_accum_count > 0
                     avg_wm = torch.zeros(N_all, device="cuda")
                     avg_wm[observed] = wm_accum[observed] / wm_accum_count[observed]
@@ -403,7 +403,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         cur_opacity = gaussians.get_opacity.squeeze(-1)
                         decayed = cur_opacity.clone()
                         decayed[bg_gaussians] *= opt.wm_prune_decay
-                        new_opacity_logit = inverse_sigmoid(decayed.clamp(1e-6, 1 - 1e-6))
+                        new_opacity_logit = inverse_sigmoid(decayed.clamp(1e-4, 1 - 1e-4))
                         gaussians._opacity.data[:, 0] = new_opacity_logit
                         n_bg = int(bg_gaussians.sum().item())
                         if iteration % 2000 == 0:
