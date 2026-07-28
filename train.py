@@ -246,6 +246,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ssim_value = ssim(image_masked, gt_masked)
         else:
             # 原始路径: soft weight map or no weight map
+            # M4-standalone: 无 hard mask 时介质模型 apply 全图
+            if medium_model is not None and iteration > opt.medium_warmup_iter:
+                if not medium_B_initialized:
+                    medium_model.init_B_from_gt(gt_image)
+                    medium_B_initialized = True
+                    print(f"[M4-standalone] B_inf initialized to {medium_model.B_inf.data.tolist()}")
+                beta_frozen = iteration < opt.medium_beta_free_iter
+                medium_model.beta_raw.requires_grad_(not beta_frozen)
+                depth_map = render_pkg["depth"]
+                image = medium_model(image, depth_map)
+
             if weight_map is not None:
                 Ll1 = (weight_map * torch.abs(image - gt_image)).mean()
             else:
@@ -322,6 +333,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                if medium_model is not None:
+                    medium_path = os.path.join(scene.model_path, "point_cloud", f"iteration_{iteration}", "medium_model.pth")
+                    torch.save(medium_model.state_dict(), medium_path)
+                    print(f"[M4] Saved medium model to {medium_path}")
 
             # -------- M3.3: Prune 门控 (bg 高斯 opacity 半衰) --------
             # MUST run before densification — densify_and_prune changes gaussian

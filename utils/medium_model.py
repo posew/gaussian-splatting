@@ -81,3 +81,13 @@ class MediumModel(nn.Module):
             B_target = torch.stack(medians).to(gt_image.device)
             B_target = B_target.clamp(0.01, 0.99)
             self.B_raw.data.copy_(torch.log(B_target / (1.0 - B_target)))
+
+    def init_B_from_gt(self, gt_image):
+        """
+        无 mask 时从 GT 图像整体估计 B_inf (取每通道中位数).
+        适用于 SeathruNeRF 等全水下场景.
+        """
+        with torch.no_grad():
+            medians = [gt_image[c].median() for c in range(3)]
+            B_target = torch.stack(medians).to(gt_image.device).clamp(0.01, 0.99)
+            self.B_raw.data.copy_(torch.log(B_target / (1.0 - B_target)))

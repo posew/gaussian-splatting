@@ -27,7 +27,7 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, train_test_exp, separate_sh):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, train_test_exp, separate_sh, medium_model=None):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
 
@@ -35,8 +35,13 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(gts_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        rendering = render(view, gaussians, pipeline, background, use_trained_exp=train_test_exp, separate_sh=separate_sh)["render"]
+        render_pkg = render(view, gaussians, pipeline, background, use_trained_exp=train_test_exp, separate_sh=separate_sh)
+        rendering = render_pkg["render"]
         gt = view.original_image[0:3, :, :]
+
+        if medium_model is not None:
+            depth_map = render_pkg["depth"]
+            rendering = medium_model(rendering, depth_map)
 
         if args.train_test_exp:
             rendering = rendering[..., rendering.shape[-1] // 2:]
@@ -53,11 +58,20 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+        medium_model = None
+        medium_path = os.path.join(dataset.model_path, "point_cloud", f"iteration_{scene.loaded_iter}", "medium_model.pth")
+        if os.path.exists(medium_path):
+            from utils.medium_model import MediumModel
+            medium_model = MediumModel().cuda()
+            medium_model.load_state_dict(torch.load(medium_path, map_location="cuda"))
+            medium_model.eval()
+            print(f"[M4] Loaded medium model: β={medium_model.beta.data.tolist()}, B∞={medium_model.B_inf.data.tolist()}")
+
         if not skip_train:
-             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh)
+             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh, medium_model)
 
         if not skip_test:
-             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh)
+             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh, medium_model)
 
 if __name__ == "__main__":
     # Set up command line argument parser
