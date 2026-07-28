@@ -132,15 +132,20 @@ class OptimizationParams(ParamGroup):
         self.wm_prune_interval = 500           # prune 门控触发间隔 (iter)
         self.wm_prune_decay = 0.5              # bg 高斯 opacity 半衰系数
         self.use_explicit_bg = False            # 启用 per-view 显式背景色
-        # -- M4: 分区物理成像模型 (C1, feat-tri-gate-bg, 2026-07-26) --
+        # -- M4: 水下介质模型 C2 (分离衰减/散射, 参考 SeaSplat) --
         self.use_medium = False                # 启用水下介质模型
-        self.medium_warmup_iter = 5000         # 前 N iter 不启用介质 (让 depth 先收敛)
-        self.medium_beta_free_iter = 10000     # 前 N iter 冻结 β (只学 B_inf)
+        self.c2_from_iter = 15000              # 介质模型启动迭代
+        self.c2_init_iters = 1000              # 初始化阶段长度 (冻结 GS 几何)
+        self.beta_attn_init_r = 2.5            # 衰减 β 初始值 R
+        self.beta_attn_init_g = 2.0            # 衰减 β 初始值 G
+        self.beta_attn_init_b = 1.5            # 衰减 β 初始值 B
+        self.beta_bs_init_r = 1.5              # 散射 β 初始值 R
+        self.beta_bs_init_g = 1.2              # 散射 β 初始值 G
+        self.beta_bs_init_b = 1.0              # 散射 β 初始值 B
+        self.medium_lr = 0.01                  # 介质参数学习率
         self.w_mono = 0.1                      # 通道单调约束权重
-        self.beta_init_r = 1.5                 # β 初始值 R (红光衰减最快)
-        self.beta_init_g = 0.5                 # β 初始值 G
-        self.beta_init_b = 0.3                 # β 初始值 B
-        self.medium_lr = 0.001                 # 介质参数学习率
+        self.w_dcp = 1.0                       # DCP loss 权重
+        self.w_gw = 0.1                        # Gray World loss 权重
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

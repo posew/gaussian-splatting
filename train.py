@@ -119,20 +119,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     wm_accum = None
     wm_accum_count = None
 
-    # -------- M4: 水下介质模型 (C1) --------
+    # -------- M4: 水下介质模型 (C2: 分离衰减/散射) --------
     medium_model = None
     medium_optimizer = None
+    c2_geometry_frozen = False
     if getattr(opt, "use_medium", False):
-        from utils.medium_model import MediumModel
-        medium_model = MediumModel(
-            beta_init=(opt.beta_init_r, opt.beta_init_g, opt.beta_init_b),
+        from utils.medium_model import MediumModelV2
+        medium_model = MediumModelV2(
+            beta_attn_init=(opt.beta_attn_init_r, opt.beta_attn_init_g, opt.beta_attn_init_b),
+            beta_bs_init=(opt.beta_bs_init_r, opt.beta_bs_init_g, opt.beta_bs_init_b),
         ).cuda()
         medium_optimizer = torch.optim.Adam(medium_model.parameters(), lr=opt.medium_lr)
-        # B_inf 初始化延迟到第一帧拿到 mask 后 (init_B_from_bg_pixels)
         medium_B_initialized = False
-        print(f"[M4] Medium model ON: β_init=({opt.beta_init_r},{opt.beta_init_g},{opt.beta_init_b}), "
-              f"warmup={opt.medium_warmup_iter}, β_free={opt.medium_beta_free_iter}, "
-              f"w_mono={opt.w_mono}, lr={opt.medium_lr}")
+        print(f"[C2] Medium model ON: β_attn=({opt.beta_attn_init_r},{opt.beta_attn_init_g},{opt.beta_attn_init_b}), "
+              f"β_bs=({opt.beta_bs_init_r},{opt.beta_bs_init_g},{opt.beta_bs_init_b}), "
+              f"from_iter={opt.c2_from_iter}, init_iters={opt.c2_init_iters}, "
+              f"lr={opt.medium_lr}, w_dcp={opt.w_dcp}, w_gw={opt.w_gw}")
     # ----------------------------------------
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
@@ -156,6 +158,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+
+        # C2: 分阶段训练
+        if medium_model is not None:
+            c2_end_init = opt.c2_from_iter + opt.c2_init_iters
+            if iteration == opt.c2_from_iter:
+                for attr in ['_xyz', '_scaling', '_rotation', '_opacity']:
+                    getattr(gaussians, attr).requires_grad_(False)
+                c2_geometry_frozen = True
+                print(f"[C2] Phase 2 START (iter {iteration}): GS geometry frozen")
+            elif iteration == c2_end_init and c2_geometry_frozen:
+                for attr in ['_xyz', '_scaling', '_rotation', '_opacity']:
+                    getattr(gaussians, attr).requires_grad_(True)
+                c2_geometry_frozen = False
+                print(f"[C2] Phase 3 START (iter {iteration}): all params unfrozen")
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -184,8 +200,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        weight_map = None  # 保留到 densify 段用
-        hard_mask = None   # M3: 二值前景 mask
+        weight_map = None
+        hard_mask = None
+        J_rendered = None
+        depth_norm = None
 
         if weight_map_loader is not None:
             weight_map = weight_map_loader.get(viewpoint_cam, device=image.device)
@@ -197,24 +215,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if caustic is not None:
                 hard_mask = hard_mask * (1.0 - caustic)  # 光斑区置 0
 
-            # ---- M4: 介质模型 compositing (替代 M3.4 显式背景) ----
-            if medium_model is not None and iteration > opt.medium_warmup_iter:
-                # B_inf 首帧初始化
+            # ---- C2: 介质模型 compositing ----
+            if medium_model is not None and iteration >= opt.c2_from_iter:
                 if not medium_B_initialized:
                     medium_model.init_B_from_bg_pixels(gt_image, hard_mask)
                     medium_B_initialized = True
-                    print(f"[M4] B_inf initialized to {medium_model.B_inf.data.tolist()}")
+                    print(f"[C2] B_inf initialized to {medium_model.B_inf.data.tolist()}")
 
-                # 冻结 β (warmup < iter < beta_free) 或全部可学
-                beta_frozen = iteration < opt.medium_beta_free_iter
-                if beta_frozen:
-                    medium_model.beta_raw.requires_grad_(False)
-                else:
-                    medium_model.beta_raw.requires_grad_(True)
-
-                depth_map = render_pkg["depth"]  # (1, H, W)
-                J = image  # 高斯渲染的 radiance
-                I_fg = medium_model(J, depth_map)
+                depth_map = render_pkg["depth"]
+                d_min, d_max = depth_map.min(), depth_map.max()
+                depth_norm = (depth_map - d_min) / (d_max - d_min + 1e-6)
+                J_rendered = image
+                I_fg = medium_model(J_rendered, depth_norm)
                 B_medium = medium_model.B_inf.view(3, 1, 1)
                 image = hard_mask * I_fg + (1.0 - hard_mask) * B_medium
 
@@ -246,16 +258,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ssim_value = ssim(image_masked, gt_masked)
         else:
             # 原始路径: soft weight map or no weight map
-            # M4-standalone: 无 hard mask 时介质模型 apply 全图
-            if medium_model is not None and iteration > opt.medium_warmup_iter:
+            # C2-standalone: 无 hard mask 时介质模型 apply 全图
+            if medium_model is not None and iteration >= opt.c2_from_iter:
                 if not medium_B_initialized:
                     medium_model.init_B_from_gt(gt_image)
                     medium_B_initialized = True
-                    print(f"[M4-standalone] B_inf initialized to {medium_model.B_inf.data.tolist()}")
-                beta_frozen = iteration < opt.medium_beta_free_iter
-                medium_model.beta_raw.requires_grad_(not beta_frozen)
+                    print(f"[C2-standalone] B_inf initialized to {medium_model.B_inf.data.tolist()}")
                 depth_map = render_pkg["depth"]
-                image = medium_model(image, depth_map)
+                d_min, d_max = depth_map.min(), depth_map.max()
+                depth_norm = (depth_map - d_min) / (d_max - d_min + 1e-6)
+                J_rendered = image
+                image = medium_model(J_rendered, depth_norm)
 
             if weight_map is not None:
                 Ll1 = (weight_map * torch.abs(image - gt_image)).mean()
@@ -285,35 +298,60 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
-        # M4: 通道单调约束 (仅 β 可学阶段)
-        if (medium_model is not None
-                and iteration > opt.medium_beta_free_iter):
+        # C2: constraint losses (DCP + GW + Mono)
+        L_mono = None
+        L_dcp = None
+        L_gw = None
+        if medium_model is not None and iteration >= opt.c2_from_iter:
             L_mono = medium_model.mono_loss()
             loss = loss + opt.w_mono * L_mono
-        else:
-            L_mono = None
+
+            bs = medium_model.backscatter(depth_norm.detach())
+            direct = gt_image - bs
+            L_dcp = 1000.0 * F.relu(-direct).mean() + F.relu(direct).mean()
+            loss = loss + opt.w_dcp * L_dcp
+
+            ch_means = J_rendered.mean(dim=[1, 2])
+            L_gw = (ch_means - ch_means.mean()).pow(2).sum()
+            loss = loss + opt.w_gw * L_gw
 
         loss.backward()
 
-        # M4: medium optimizer step (独立于高斯 optimizer)
-        if medium_model is not None and iteration > opt.medium_warmup_iter:
+        # C2: medium optimizer step
+        if medium_model is not None and iteration >= opt.c2_from_iter:
             medium_optimizer.step()
             medium_optimizer.zero_grad(set_to_none=True)
             if tb_writer:
-                tb_writer.add_scalar('medium/beta_R', medium_model.beta[0].item(), iteration)
-                tb_writer.add_scalar('medium/beta_G', medium_model.beta[1].item(), iteration)
-                tb_writer.add_scalar('medium/beta_B', medium_model.beta[2].item(), iteration)
-                tb_writer.add_scalar('medium/B_inf_R', medium_model.B_inf[0].item(), iteration)
-                tb_writer.add_scalar('medium/B_inf_G', medium_model.B_inf[1].item(), iteration)
-                tb_writer.add_scalar('medium/B_inf_B', medium_model.B_inf[2].item(), iteration)
+                tb_writer.add_scalar('c2/beta_attn_R', medium_model.beta_attn[0].item(), iteration)
+                tb_writer.add_scalar('c2/beta_attn_G', medium_model.beta_attn[1].item(), iteration)
+                tb_writer.add_scalar('c2/beta_attn_B', medium_model.beta_attn[2].item(), iteration)
+                tb_writer.add_scalar('c2/beta_bs_R', medium_model.beta_bs[0].item(), iteration)
+                tb_writer.add_scalar('c2/beta_bs_G', medium_model.beta_bs[1].item(), iteration)
+                tb_writer.add_scalar('c2/beta_bs_B', medium_model.beta_bs[2].item(), iteration)
+                tb_writer.add_scalar('c2/B_inf_R', medium_model.B_inf[0].item(), iteration)
+                tb_writer.add_scalar('c2/B_inf_G', medium_model.B_inf[1].item(), iteration)
+                tb_writer.add_scalar('c2/B_inf_B', medium_model.B_inf[2].item(), iteration)
                 if L_mono is not None:
-                    tb_writer.add_scalar('medium/L_mono', L_mono.item(), iteration)
+                    tb_writer.add_scalar('c2/L_mono', L_mono.item(), iteration)
+                if L_dcp is not None:
+                    tb_writer.add_scalar('c2/L_dcp', L_dcp.item(), iteration)
+                if L_gw is not None:
+                    tb_writer.add_scalar('c2/L_gw', L_gw.item(), iteration)
             if iteration % 5000 == 0:
-                b = medium_model.beta.data.tolist()
+                ba = medium_model.beta_attn.data.tolist()
+                bb = medium_model.beta_bs.data.tolist()
                 bi = medium_model.B_inf.data.tolist()
-                mono_str = f", L_mono={L_mono.item():.4f}" if L_mono is not None else ""
-                print(f"[M4] iter {iteration}: β=({b[0]:.3f},{b[1]:.3f},{b[2]:.3f}), "
-                      f"B∞=({bi[0]:.3f},{bi[1]:.3f},{bi[2]:.3f}){mono_str}")
+                extras = []
+                if L_dcp is not None:
+                    extras.append(f"L_dcp={L_dcp.item():.4f}")
+                if L_gw is not None:
+                    extras.append(f"L_gw={L_gw.item():.4f}")
+                if L_mono is not None:
+                    extras.append(f"L_mono={L_mono.item():.4f}")
+                print(f"[C2] iter {iteration}: β_attn=({ba[0]:.3f},{ba[1]:.3f},{ba[2]:.3f}), "
+                      f"β_bs=({bb[0]:.3f},{bb[1]:.3f},{bb[2]:.3f}), "
+                      f"B∞=({bi[0]:.3f},{bi[1]:.3f},{bi[2]:.3f})"
+                      + (", " + ", ".join(extras) if extras else ""))
 
         iter_end.record()
 
@@ -336,7 +374,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if medium_model is not None:
                     medium_path = os.path.join(scene.model_path, "point_cloud", f"iteration_{iteration}", "medium_model.pth")
                     torch.save(medium_model.state_dict(), medium_path)
-                    print(f"[M4] Saved medium model to {medium_path}")
+                    print(f"[C2] Saved medium model to {medium_path}")
 
             # -------- M3.3: Prune 门控 (bg 高斯 opacity 半衰) --------
             # MUST run before densification — densify_and_prune changes gaussian

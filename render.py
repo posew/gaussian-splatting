@@ -41,6 +41,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
         if medium_model is not None:
             depth_map = render_pkg["depth"]
+            if hasattr(medium_model, 'beta_attn'):
+                d_min, d_max = depth_map.min(), depth_map.max()
+                depth_map = (depth_map - d_min) / (d_max - d_min + 1e-6)
             rendering = medium_model(rendering, depth_map)
 
         if args.train_test_exp:
@@ -61,11 +64,20 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         medium_model = None
         medium_path = os.path.join(dataset.model_path, "point_cloud", f"iteration_{scene.loaded_iter}", "medium_model.pth")
         if os.path.exists(medium_path):
-            from utils.medium_model import MediumModel
-            medium_model = MediumModel().cuda()
-            medium_model.load_state_dict(torch.load(medium_path, map_location="cuda"))
-            medium_model.eval()
-            print(f"[M4] Loaded medium model: β={medium_model.beta.data.tolist()}, B∞={medium_model.B_inf.data.tolist()}")
+            state_dict = torch.load(medium_path, map_location="cuda")
+            if "beta_attn_raw" in state_dict:
+                from utils.medium_model import MediumModelV2
+                medium_model = MediumModelV2().cuda()
+                medium_model.load_state_dict(state_dict)
+                medium_model.eval()
+                print(f"[C2] Loaded MediumModelV2: β_attn={medium_model.beta_attn.data.tolist()}, "
+                      f"β_bs={medium_model.beta_bs.data.tolist()}, B∞={medium_model.B_inf.data.tolist()}")
+            else:
+                from utils.medium_model import MediumModel
+                medium_model = MediumModel().cuda()
+                medium_model.load_state_dict(state_dict)
+                medium_model.eval()
+                print(f"[C1] Loaded MediumModel: β={medium_model.beta.data.tolist()}, B∞={medium_model.B_inf.data.tolist()}")
 
         if not skip_train:
              render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.train_test_exp, separate_sh, medium_model)
