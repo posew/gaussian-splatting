@@ -308,7 +308,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             bs = medium_model.backscatter(depth_norm.detach())
             direct = gt_image - bs
-            L_dcp = 1000.0 * F.relu(-direct).mean() + F.relu(direct).mean()
+            L_dcp = F.relu(bs - gt_image).mean()
             loss = loss + opt.w_dcp * L_dcp
 
             ch_means = J_rendered.mean(dim=[1, 2])

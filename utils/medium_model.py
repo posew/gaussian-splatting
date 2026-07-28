@@ -92,11 +92,11 @@ class MediumModelV2(nn.Module):
 
     @property
     def beta_attn(self):
-        return F.softplus(self.beta_attn_raw) + 1e-2
+        return F.softplus(self.beta_attn_raw).clamp(max=5.0) + 1e-2
 
     @property
     def beta_bs(self):
-        return F.softplus(self.beta_bs_raw) + 1e-2
+        return F.softplus(self.beta_bs_raw).clamp(max=5.0) + 1e-2
 
     @property
     def B_inf(self):
