@@ -704,6 +704,8 @@ class WeightMapLoader:
         H, W = img_bgr.shape[:2]
         self._ensure_colmap_seeds((H, W))
         seed = self._colmap_seed_masks.get(viewpoint_cam.image_name, None)
+        if seed is None:
+            seed = self._colmap_seed_masks.get(os.path.splitext(viewpoint_cam.image_name)[0], None)
         result = compute_wm_v2(
             img_bgr,
             colmap_seed_mask=seed,
